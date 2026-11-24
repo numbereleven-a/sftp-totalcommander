@@ -69,6 +69,8 @@ struct tConnectSettings {
     std::string server;
     std::string user;
     std::string password;
+    std::string typed_password;          // temporary password typed during kbd-int; committed only on auth success
+    std::string changed_password;        // new password entered at kbd-int forced password change
     std::string connectsendcommand;
     std::string sftpservercommand;
     WCHAR lastactivepath[1024];
@@ -108,7 +110,9 @@ struct tConnectSettings {
     SYSTICKS lastpercenttime;
     int lastpercent;
     sftp::PassSaveMode passSaveMode;
-    bool InteractivePasswordSent;
+    bool InteractivePasswordSent = false;
+    bool key_passphrase_used = false;    // stored password unlocked key; do not reuse as account password
+    SYSTICKS authPromptDone = 0;         // tick when last interactive auth prompt returned
     int trycustomlistcommand;  // set to 2 initially, reduce to 1 or 0 if failing
     int scpserver64bit;     // 0=no, 1=yes, -1, auto-detect
     bool scpserver64bittemporary;  // true=user allowed transfers>2GB
@@ -150,6 +154,8 @@ struct tConnectSettings {
     unsigned short jump_port       = 22;
     std::string    jump_user;
     std::string    jump_password;
+    std::string    jump_entered_password;
+    bool           jump_cryptpass  = false;
     std::string    jump_pubkeyfile;
     std::string    jump_privkeyfile;
     bool           jump_useagent   = false;
@@ -172,6 +178,24 @@ struct tConnectSettings {
     WCHAR current_sourceW[wdirtypemax];
     WCHAR current_targetW[wdirtypemax];
     std::unique_ptr<IUserFeedback> feedback;
+
+    tConnectSettings() = default;
+    tConnectSettings(tConnectSettings&&) noexcept = default;
+    tConnectSettings& operator=(tConnectSettings&&) noexcept = default;
+    tConnectSettings(const tConnectSettings&) = delete;
+    tConnectSettings& operator=(const tConnectSettings&) = delete;
+
+    ~tConnectSettings()
+    {
+        for (std::string* s : { &password, &typed_password, &changed_password,
+                                &proxypassword, &jump_password, &jump_entered_password }) {
+            if (!s->empty()) {
+                s->resize(s->capacity());
+                SecureZeroMemory(s->data(), s->size());
+                s->clear();
+            }
+        }
+    }
 };
 
 using pConnectSettings = tConnectSettings*;

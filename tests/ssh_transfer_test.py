@@ -144,7 +144,7 @@ class Peer(paramiko.ServerInterface):
                     pending += data
                     while b"\n" in pending:
                         line, pending = pending.split(b"\n", 1)
-                        if b'echo "__WFX_DD_BEGIN__' in line:
+                        if b'echo "__WFX_DD_BEGIN__' in line or b'echo "__WF""X_DD_BEGIN__' in line:
                             self.command_count += 1
                             if self.delay:
                                 time.sleep(self.delay)
@@ -190,7 +190,11 @@ class Peer(paramiko.ServerInterface):
                 raise PermissionError()
             if "t" in arguments[1]:
                 channel.sendall(b"\0")
-                header = receive_line(channel).split(b" ", 2)
+                raw_header = receive_line(channel)
+                if raw_header.startswith(b"T"):
+                    channel.sendall(b"\0")
+                    raw_header = receive_line(channel)
+                header = raw_header.split(b" ", 2)
                 size = int(header[1])
                 channel.sendall(b"\0")
                 data = b""

@@ -8,6 +8,7 @@
 #include "PluginEntryPoints.h"
 #include "CoreUtils.h"
 #include "res/resource.h"
+#include "ProfileSettings.h"
 #include "ConnectionNetwork.h"
 
 int EstablishSocketConnection(pConnectSettings ConnectSettings, LPCSTR connecttoserver, unsigned short connecttoport, int& progress, int& loop, SYSTICKS& lasttime)
@@ -39,8 +40,12 @@ int EstablishSocketConnection(pConnectSettings ConnectSettings, LPCSTR connectto
     }
     const ULONGLONG deadline = GetTickCount64() + 30000;
     ConnectSettings->sock = INVALID_SOCKET;
+    bool cancelled = false;
     for (struct addrinfo* ai = res; ai; ai = ai->ai_next) {
-        closesocket(ConnectSettings->sock);
+        if (ConnectSettings->sock != INVALID_SOCKET) {
+            closesocket(ConnectSettings->sock);
+            ConnectSettings->sock = INVALID_SOCKET;
+        }
         ConnectSettings->sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (ConnectSettings->sock == INVALID_SOCKET)
             continue;
@@ -64,23 +69,27 @@ int EstablishSocketConnection(pConnectSettings ConnectSettings, LPCSTR connectto
                 }
                 if (IsSocketError(ConnectSettings->sock))
                     break;
-                if (ProgressLoop(progressBuf.data(), 0, progress, &loop, &lasttime))
+                if (ProgressLoop(progressBuf.data(), 0, progress, &loop, &lasttime)) {
+                    cancelled = true;
                     break;
+                }
             }
         }
-        if (connected)
+        if (connected || cancelled)
             break;
     }
     freeaddrinfo(res);
 
     if (!connected) {
-        if (ConnectSettings->proxytype != sftp::Proxy::notused)
-            ShowErrorId(IDS_ERR_PROXYCONNECT);
-        else
-            ShowErrorId(IDS_ERR_SERVERCONNECT);
-        if (LogProc) {
-            const std::string msg = std::format("SFTP: TCP connect failed to '{}:{}' (WSA error {})", connecttoserver, connecttoport, WSAGetLastError());
-            LogProc(PluginNumber, MSGTYPE_IMPORTANTERROR, msg.c_str());
+        if (!cancelled) {
+            if (ConnectSettings->proxytype != sftp::Proxy::notused)
+                ShowErrorId(IDS_ERR_PROXYCONNECT);
+            else
+                ShowErrorId(IDS_ERR_SERVERCONNECT);
+            if (LogProc) {
+                const std::string msg = std::format("SFTP: TCP connect failed to '{}:{}' (WSA error {})", connecttoserver, connecttoport, WSAGetLastError());
+                LogProc(PluginNumber, MSGTYPE_IMPORTANTERROR, msg.c_str());
+            }
         }
         return -30;
     }
@@ -99,14 +108,11 @@ bool InitializeSftpSubsystemIfNeeded(pConnectSettings ConnectSettings, int progr
     if (ConnectSettings->sftpservercommand.empty() &&
         !ConnectSettings->DisplayName.empty() &&
         !ConnectSettings->IniFileName.empty()) {
-        std::array<char, MAX_PATH> commandBuf{};
-        GetPrivateProfileString(ConnectSettings->DisplayName.c_str(),
-                                "sftpservercommand",
-                                "",
-                                commandBuf.data(),
-                                commandBuf.size() - 1,
-                                ConnectSettings->IniFileName.c_str());
-        ConnectSettings->sftpservercommand = commandBuf.data();
+        ConnectSettings->sftpservercommand = ReadIniString(
+            ConnectSettings->DisplayName.c_str(),
+            "sftpservercommand",
+            "",
+            ConnectSettings->IniFileName.c_str());
     }
 
     ShowStatusId(IDS_LOG_SFTP_INIT, nullptr, true);

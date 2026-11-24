@@ -31,3 +31,4 @@ void  ApplyTcLanguageToPluginResources(const char* tcIniPath) noexcept;
 
 // LAN path conversion — defined in PluginEntryPointsFind.cpp, also used by PluginEntryPointsFile.cpp.
 std::string LanRemotePathToUtf8(LPCWSTR remotedir);
+void SanitizeLocalFileNameW(LPWSTR localPath) noexcept;

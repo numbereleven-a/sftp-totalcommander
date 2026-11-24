@@ -100,8 +100,10 @@ std::optional<std::vector<uint8_t>> dpapiProtect(std::span<const uint8_t> plain)
     in.cbData = static_cast<DWORD>(plain.size());
 
     DATA_BLOB out{};
+    // Protect per current Windows user account (not machine-wide).
+    // CryptUnprotectData still transparently decrypts legacy machine-scoped blobs.
     if (!CryptProtectData(&in, L"sftpplug-lanpair", nullptr, nullptr, nullptr,
-                          CRYPTPROTECT_UI_FORBIDDEN | CRYPTPROTECT_LOCAL_MACHINE, &out))
+                          CRYPTPROTECT_UI_FORBIDDEN, &out))
         return std::nullopt;
 
     std::vector<uint8_t> enc(out.pbData, out.pbData + out.cbData);
@@ -120,6 +122,7 @@ std::optional<std::vector<uint8_t>> dpapiUnprotect(std::span<const uint8_t> ciph
         return std::nullopt;
 
     std::vector<uint8_t> plain(out.pbData, out.pbData + out.cbData);
+    SecureZeroMemory(out.pbData, out.cbData);
     LocalFree(out.pbData);
     return plain;
 }

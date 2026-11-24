@@ -1,7 +1,9 @@
 #include "global.h"
 #include <windows.h>
+#include <bcrypt.h>
 #include <ws2tcpip.h>
 #include <array>
+#include <atomic>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -14,6 +16,7 @@
 #include "CoreUtils.h"
 #include "UtfConversion.h"
 #include "SftpInternal.h"
+#include "ScpTransfer.h"
 #include "TerminalText.h"
 #include "UnicodeHelpers.h"
 
@@ -273,11 +276,82 @@ bool EnsureScpShell(pConnectSettings cs)
 
     // Servers (e.g., home.pl) lose the first login if we send it immediately.
     // We give the shell time to load /etc/profile and the MOTD.
-    Sleep(500); 
+    Sleep(500);
 
     cs->scpShellChannel = std::move(channel);
     cs->scpShellMsgBuf.clear();
     cs->scpShellErrBuf.clear();
+
+    // Switch csh/tcsh/fish login shells to POSIX /bin/sh and disable terminal echo
+    // (fallback for servers that ignore PTY ECHO=0).
+    {
+        const std::string initCmd = "exec /bin/sh\nstty -echo 2>/dev/null\n";
+        size_t written = 0;
+        const auto start = std::chrono::steady_clock::now();
+        while (written < initCmd.size()) {
+            const int rc = static_cast<int>(
+                cs->scpShellChannel->write(initCmd.data() + written, initCmd.size() - written));
+            if (rc > 0) {
+                written += static_cast<size_t>(rc);
+                continue;
+            }
+            if (rc != LIBSSH2_ERROR_EAGAIN)
+                break;
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - start).count() > kScpShellOpenTimeoutMs)
+                break;
+            WaitForSshIo(cs);
+        }
+        Sleep(200);
+        std::array<char, 1024> drain{};
+        while (cs->scpShellChannel->read(drain.data(), drain.size()) > 0) {}
+        while (cs->scpShellChannel->readStderr(drain.data(), drain.size()) > 0) {}
+    }
+    return true;
+}
+
+bool ShellCommandIsSafe(std::string_view text) noexcept
+{
+    for (const char ch : text) {
+        const unsigned char c = static_cast<unsigned char>(ch);
+        if (c < 0x20u || c == 0x7Fu)
+            return false;
+    }
+    return true;
+}
+
+std::string ShellMarker(const char* base)
+{
+    uint8_t rnd[8] = {};
+    if (BCryptGenRandom(nullptr, rnd, sizeof(rnd), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+        static std::atomic<uint64_t> fallbackSeq{1};
+        const uint64_t v = fallbackSeq.fetch_add(1) ^ GetTickCount64();
+        memcpy(rnd, &v, sizeof(rnd));
+    }
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out = base ? base : "__WFX__";
+    out.push_back('_');
+    for (uint8_t b : rnd) {
+        out.push_back(kHex[b >> 4]);
+        out.push_back(kHex[b & 0x0F]);
+    }
+    return out;
+}
+
+std::string ShellEchoMarker(const std::string& marker)
+{
+    const size_t cut = (std::min)(marker.size(), size_t{4});
+    return "echo \"" + marker.substr(0, cut) + "\"\"" + marker.substr(cut) + "\"";
+}
+
+bool RemoteEntryNameIsSafeW(LPCWSTR name) noexcept
+{
+    if (!name || !name[0])
+        return false;
+    for (const wchar_t* p = name; *p; ++p) {
+        if (*p == L'\\' || *p == L'/' || static_cast<unsigned>(*p) < 0x20u || *p == 0x7Fu)
+            return false;
+    }
     return true;
 }
 
@@ -314,15 +388,25 @@ bool ScpReadCommandOutput(pConnectSettings cs, const char* endMarker,
     const bool hasBegin = !beginMarkerStr.empty();
 
     std::string lineStr;
-    const auto start = std::chrono::steady_clock::now();
+    auto lastLine = std::chrono::steady_clock::now();
     bool gotBegin = !hasBegin;
     bool gotEnd = false;
 
-    while (ReadChannelLine(cs->scpShellChannel.get(),
-                           lineStr,
-                           cs->scpShellMsgBuf, cs->scpShellErrBuf,
-                           cs->sock))
-    {
+    for (;;) {
+        if (!ReadChannelLine(cs->scpShellChannel.get(),
+                             lineStr,
+                             cs->scpShellMsgBuf, cs->scpShellErrBuf,
+                             cs->sock, 1000, 1000)) {
+            if (cs->scpShellChannel->eof() || EscapePressed() ||
+                (cs->sock != INVALID_SOCKET && IsSocketError(cs->sock)))
+                break;
+            const auto quiet = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - lastLine).count();
+            if (quiet > static_cast<long long>(timeoutMs))
+                break;
+            continue;
+        }
+        lastLine = std::chrono::steady_clock::now();
         StripEscapeSequences(lineStr);
         std::string_view trimmed = TrimLeft(lineStr);
 
@@ -344,10 +428,6 @@ bool ScpReadCommandOutput(pConnectSettings cs, const char* endMarker,
 
         outLines.push_back(std::move(lineStr));
 
-        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - start).count();
-        if (elapsed > timeoutMs)
-            break;
         if (EscapePressed())
             break;
     }
@@ -417,6 +497,8 @@ bool ReadChannelLine(ISshChannel* channel, std::string& outLine,
                 IsSocketReadable(sock);
             else
                 Sleep(consecutiveEagain > 20 ? 200 : 50);
+        } else if (rc < 0) {
+            endReceived = true;
         }
 
         if (endReceived && rc <= 0 && rc != LIBSSH2_ERROR_EAGAIN) {
@@ -480,15 +562,13 @@ int SftpQuoteCommand2(pConnectSettings cs, const char* remotedir, const char* cm
 
     // Replace backslashes with slashes
     std::replace(dirname.begin(), dirname.end(), '\\', '/');
+    if ((remotedir && !ShellCommandIsSafe(dirname)) || !ShellCommandIsSafe(cmdname))
+        return -1;
 
     std::string display = "Quote: ";
     display += cmd;
     std::replace(display.begin(), display.end(), '\\', '/');
     ShowStatus(display.c_str());
-
-    auto channel = ConnectChannel(cs->session.get(), cs->sock);
-    if (!channel)
-        return -1;
 
     // Build command: cd <dir> && <cmd> (if dir given)
     std::string fullCmd;
@@ -497,6 +577,29 @@ int SftpQuoteCommand2(pConnectSettings cs, const char* remotedir, const char* cm
         fullCmd += string_util::ShellQuoteSingle(dirname) + "' && ";
     }
     fullCmd += cmdname;
+
+    if (cs->shell_transfer_force) {
+        std::vector<std::string> lines;
+        int exitCode = -1;
+        // Run in a subshell so `exit N` or `cd` never kills or mutates the persistent shell.
+        const std::string subshellCmd = "( " + fullCmd + " )";
+        if (!ShellRunPersistentCommand(cs, subshellCmd, lines, &exitCode))
+            return -1;
+        for (const auto& l : lines) {
+            if (!reply) {
+                ShowStatus(l.c_str());
+            } else {
+                if (reply[0])
+                    strlcat(reply, "\r\n", replylen);
+                strlcat(reply, l.c_str(), replylen);
+            }
+        }
+        return exitCode >= 0 ? exitCode : 1;
+    }
+
+    auto channel = ConnectChannel(cs->session.get(), cs->sock);
+    if (!channel)
+        return -1;
 
     if (!SendChannelCommand(cs->session.get(), channel.get(), fullCmd.c_str(), cs->sock)) {
         return -1;
@@ -576,15 +679,13 @@ int SftpQuoteCommand2W(pConnectSettings cs, LPCWSTR remotedir, LPCWSTR cmd,
     }
 
     std::replace(dirname.begin(), dirname.end(), '\\', '/');
+    if ((remotedir && !ShellCommandIsSafe(dirname)) || !ShellCommandIsSafe(cmdname))
+        return -1;
 
     std::wstring display = L"Quote: ";
     display += cmd;
     std::replace(display.begin(), display.end(), L'\\', L'/');
     ShowStatusW(display.c_str());
-
-    auto channel = ConnectChannel(cs->session.get(), cs->sock);
-    if (!channel)
-        return -1;
 
     std::string fullCmd;
     if (remotedir) {
@@ -592,6 +693,31 @@ int SftpQuoteCommand2W(pConnectSettings cs, LPCWSTR remotedir, LPCWSTR cmd,
         fullCmd += string_util::ShellQuoteSingle(dirname) + "' && ";
     }
     fullCmd += cmdname;
+
+    if (cs->shell_transfer_force) {
+        std::vector<std::string> lines;
+        int exitCode = -1;
+        // Run in a subshell so `exit N` or `cd` never kills or mutates the persistent shell.
+        const std::string subshellCmd = "( " + fullCmd + " )";
+        if (!ShellRunPersistentCommand(cs, subshellCmd, lines, &exitCode))
+            return -1;
+        for (const auto& l : lines) {
+            if (!reply) {
+                std::array<wchar_t, 4096> wline{};
+                CopyStringA2W(cs, l.c_str(), wline.data(), wline.size() - 1, false);
+                ShowStatusW(wline.data());
+            } else {
+                if (reply[0])
+                    strlcat(reply, "\r\n", replylen);
+                strlcat(reply, l.c_str(), replylen);
+            }
+        }
+        return exitCode >= 0 ? exitCode : 1;
+    }
+
+    auto channel = ConnectChannel(cs->session.get(), cs->sock);
+    if (!channel)
+        return -1;
 
     if (!SendChannelCommand(cs->session.get(), channel.get(), fullCmd.c_str(), cs->sock)) {
         return -1;
@@ -604,25 +730,26 @@ int SftpQuoteCommand2W(pConnectSettings cs, LPCWSTR remotedir, LPCWSTR cmd,
     int loop = 0;
     auto lasttime = get_sys_ticks();
 
-    while (ReadChannelLine(channel.get(), linebuf.data(), linebuf.size() - 1,
-                           msgbuf, errbuf, cs->sock))
-    {
-        StripEscapeSequences(linebuf.data());
-        if (!reply) {
-            std::array<wchar_t, 4096> wline{};
-            CopyStringA2W(cs, linebuf.data(), wline.data(), wline.size() - 1, false);
-            ShowStatusW(wline.data());
-        } else {
-            if (reply[0])
-                strlcat(reply, "\r\n", replylen);
-            strlcat(reply, linebuf.data(), replylen);
+    while (true) {
+        if (ReadChannelLine(channel.get(), linebuf.data(), linebuf.size() - 1,
+                            msgbuf, errbuf, cs->sock, 2000, 2000)) {
+            StripEscapeSequences(linebuf.data());
+            if (!reply) {
+                std::array<wchar_t, 4096> wline{};
+                CopyStringA2W(cs, linebuf.data(), wline.data(), wline.size() - 1, false);
+                ShowStatusW(wline.data());
+            } else {
+                if (reply[0])
+                    strlcat(reply, "\r\n", replylen);
+                strlcat(reply, linebuf.data(), replylen);
+            }
+        } else if (channel->eof() || IsSocketError(cs->sock)) {
+            break;
         }
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start).count();
-        if (elapsed > kQuoteProgressStartMs) {
-            if (ProgressLoop("QUOTE", 0, 100, &loop, &lasttime))
-                break;
-        }
+        if (elapsed > kQuoteProgressStartMs && ProgressLoop("QUOTE", 0, 100, &loop, &lasttime))
+            break;
     }
 
     if (!channel->eof()) return -1;

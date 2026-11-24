@@ -122,22 +122,27 @@ int InitializeSshSession(
     progress = 40; // PROG_SESSION_STARTUP
     LoadStr(buf, IDS_SESSION_STARTUP);
     int auth;
+    bool cancelled = false;
     const ULONGLONG deadline = GetTickCount64() + 30000;
     while ((auth = ConnectSettings->session->startup((int)ConnectSettings->sock)) == LIBSSH2_ERROR_EAGAIN) {
         if (GetTickCount64() >= deadline) { auth = LIBSSH2_ERROR_TIMEOUT; break; }
-        if (ProgressLoop(buf.data(), progress, progress + 20, &loop, &lasttime))
+        if (ProgressLoop(buf.data(), progress, progress + 20, &loop, &lasttime)) {
+            cancelled = true;
             break;
+        }
         WaitForTransportReadable(ConnectSettings);
     }
 
     if (auth) {
-        char* errmsg;
-        int errmsg_len;
-        ConnectSettings->session->lastError(&errmsg, &errmsg_len, false);
-        ShowErrorId(IDS_ERR_SSH_SESSION, errmsg);
-        if (LogProc) {
-            const std::string msg = std::format("SFTP: SSH handshake failed: {}", errmsg ? errmsg : "(no details)");
-            LogProc(PluginNumber, MSGTYPE_IMPORTANTERROR, msg.c_str());
+        if (!cancelled) {
+            char* errmsg;
+            int errmsg_len;
+            ConnectSettings->session->lastError(&errmsg, &errmsg_len, false);
+            ShowErrorId(IDS_ERR_SSH_SESSION, errmsg);
+            if (LogProc) {
+                const std::string msg = std::format("SFTP: SSH handshake failed: {}", errmsg ? errmsg : "(no details)");
+                LogProc(PluginNumber, MSGTYPE_IMPORTANTERROR, msg.c_str());
+            }
         }
         return -70;
     }

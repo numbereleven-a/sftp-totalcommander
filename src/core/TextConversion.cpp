@@ -1,8 +1,11 @@
 #include <windows.h>
+#include <algorithm>
 #include <string>
+#include <vector>
 #include <cstring>
 #include <cstdint>
 #include <climits>
+#include "ScpTransferInternal.h"
 
 int ConvertCrToCrLf(LPSTR data, size_t len, size_t capacity, bool* pLastWasCr)
 {
@@ -106,4 +109,64 @@ size_t CrLfToLfStateful(const char* in, size_t len, char* out, bool& pendingCr)
         out[o++] = ch;
     }
     return o;
+}
+
+void DownloadTextFilter::AppendConverted(const char* data, size_t len, std::vector<char>& out)
+{
+    out.reserve(out.size() + len + len / 8 + 1);
+    for (size_t i = 0; i < len; ++i) {
+        const unsigned char c = static_cast<unsigned char>(data[i]);
+        if (c == '\r') {
+            lastWasCr_ = true;
+            out.push_back('\r');
+        } else if (c == '\n') {
+            if (!lastWasCr_)
+                out.push_back('\r');
+            out.push_back('\n');
+            lastWasCr_ = false;
+        } else {
+            lastWasCr_ = false;
+            out.push_back(static_cast<char>(c));
+        }
+    }
+}
+
+size_t DownloadTextFilter::Release(std::vector<char>& out)
+{
+    deciding_ = false;
+    const size_t before = out.size();
+    if (text_) {
+        AppendConverted(held_.data(), held_.size(), out);
+    } else {
+        out.insert(out.end(), held_.begin(), held_.end());
+    }
+    held_.clear();
+    held_.shrink_to_fit();
+    return out.size() - before;
+}
+
+size_t DownloadTextFilter::Feed(const char* data, size_t len, std::vector<char>& out)
+{
+    if (!data || len == 0)
+        return 0;
+    if (deciding_) {
+        held_.insert(held_.end(), data, data + len);
+        const auto windowEnd = held_.begin() + static_cast<std::ptrdiff_t>((std::min)(held_.size(), kWindow));
+        if (std::find(held_.begin(), windowEnd, '\0') != windowEnd)
+            text_ = false;
+        if (!text_ || held_.size() >= kWindow)
+            return Release(out);
+        return 0;
+    }
+    const size_t before = out.size();
+    if (text_)
+        AppendConverted(data, len, out);
+    else
+        out.insert(out.end(), data, data + len);
+    return out.size() - before;
+}
+
+size_t DownloadTextFilter::Finish(std::vector<char>& out)
+{
+    return deciding_ ? Release(out) : 0;
 }

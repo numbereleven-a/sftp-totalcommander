@@ -28,6 +28,11 @@ static constexpr BYTE SOCKS5_AUTH_REJECT = 0xFF;
 int SftpConnectProxyHttp(pConnectSettings ConnectSettings, LPCSTR progressbuf, int progress, int * ploop, SYSTICKS * plasttime)
 {
     std::array<char, 1024> buf{};
+    struct BufWipe {
+        char* ptr;
+        size_t len;
+        ~BufWipe() { SecureZeroMemory(ptr, len); }
+    } bufWipe{buf.data(), buf.size()};
     const char* server = ConnectSettings->server.c_str();
     const char* proxyUser = ConnectSettings->proxyuser.c_str();
     const char* proxyServer = ConnectSettings->proxyserver.c_str();
@@ -48,6 +53,14 @@ int SftpConnectProxyHttp(pConnectSettings ConnectSettings, LPCSTR progressbuf, i
         std::array<char, 500> buf2{};
         std::array<char, 250> title{};
         std::array<char, 256> passphrase{};
+        struct CredWipe {
+            char* a; size_t al; char* b; size_t bl; char* c; size_t cl;
+            ~CredWipe() {
+                SecureZeroMemory(a, al);
+                SecureZeroMemory(b, bl);
+                SecureZeroMemory(c, cl);
+            }
+        } credWipe{buf1.data(), buf1.size(), buf2.data(), buf2.size(), passphrase.data(), passphrase.size()};
         strlcpy(passphrase.data(), proxyPass, passphrase.size()-1);
 
         LoadStr(buf1, IDS_PROXY_PASSWORD_FOR);
@@ -56,8 +69,10 @@ int SftpConnectProxyHttp(pConnectSettings ConnectSettings, LPCSTR progressbuf, i
         strlcat(title.data(), "@", title.size()-1);
         strlcat(title.data(), proxyServer, title.size()-1);
         LoadStr(buf1, IDS_PROXY_PASSWORD);
-        if (passphrase[0] == 0)
-            RequestProc(PluginNumber, RT_Password, title.data(), buf1.data(), passphrase.data(), passphrase.size()-1);
+        if (passphrase[0] == 0) {
+            if (!RequestProc || !RequestProc(PluginNumber, RT_Password, title.data(), buf1.data(), passphrase.data(), passphrase.size()-1))
+                return -1;
+        }
 
         if (strlen(proxyUser) + strlen(passphrase.data()) + 2 >= buf1.size()) return -1;
         strlcpy(buf1.data(), proxyUser, buf1.size()-1);
@@ -70,11 +85,18 @@ int SftpConnectProxyHttp(pConnectSettings ConnectSettings, LPCSTR progressbuf, i
     }
     strlcat(buf.data(), "\r\n", buf.size()-1);
     mysend(ConnectSettings->sock, buf.data(), (int)strlen(buf.data()), 0, progressbuf, progress, ploop, plasttime);
+    SecureZeroMemory(buf.data(), buf.size());
     // Response;
     // HTTP/1.0 200 Connection established
     // Proxy-agent: WinProxy/1.5.3<2xCRLF>
     bool lastcrlfcrlf = false;
     int nrbytes = myrecv(ConnectSettings->sock, buf.data(), 12, 0, progressbuf, progress, ploop, plasttime);
+    std::string statusLine;
+    if (nrbytes > 0) {
+        statusLine.assign(buf.data(), static_cast<size_t>(nrbytes));
+        while (!statusLine.empty() && (statusLine.back() == '\r' || statusLine.back() == '\n'))
+            statusLine.pop_back();
+    }
     if (nrbytes == 12 && buf[9] == '2') {    // Proxy signaled success.
                                              // read data until we get 2xCRLF
         bool lastcrlf = false;
@@ -105,7 +127,8 @@ int SftpConnectProxyHttp(pConnectSettings ConnectSettings, LPCSTR progressbuf, i
         }
     }
     if (!lastcrlfcrlf) {
-        ShowErrorId(IDS_VIA_PROXY_CONNECT);
+        const std::string suffix = statusLine.empty() ? std::string() : ("\n" + statusLine);
+        ShowErrorId(IDS_VIA_PROXY_CONNECT, suffix.empty() ? nullptr : suffix.c_str());
         return -1;
     }
     return SFTP_OK;
@@ -190,6 +213,7 @@ int SftpConnectProxySocks5(pConnectSettings ConnectSettings, int connecttoport, 
         nrbytes += len + 1;
 
         mysend(ConnectSettings->sock, buf.data(), nrbytes, 0, progressbuf, progress, ploop, plasttime);
+        SecureZeroMemory(buf.data(), buf.size());
         nrbytes = myrecv(ConnectSettings->sock, buf.data(), 2, 0, progressbuf, progress, ploop, plasttime);
         if (nrbytes != 2 || buf[1] != 0) {
             LoadStr(buf, IDS_SOCKS5PROXYERR);

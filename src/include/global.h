@@ -73,18 +73,21 @@ constexpr size_t wdirtypemax = 1024;
 // Logging Configuration
 // ============================================================================
 // Set LOG_TO_FILE to 1 to enable file logging, 0 to disable.
-// When enabled, output goes to LOG_FILE_PATH (created automatically).
+// When enabled, output goes to LOG_FILE_NAME inside the current user's %TEMP%.
 // OutputDebugString is always used when logging is active.
 // WARNING: File logging is slow — enable only during active investigation.
 
+#ifndef LOG_ENABLED
 #define LOG_ENABLED  0                              // Master switch: 0 = off, 1 = on
+#endif
+#ifndef LOG_TO_FILE
 #define LOG_TO_FILE  0                              // 0 = OutputDebugString only, 1 = + file
-#define LOG_FILE_PATH "C:\\temp\\sftpplug.log"     // Log file path (directory created automatically)
+#endif
+#define LOG_FILE_NAME L"sftpplug.log"               // File name inside %TEMP%
 
 // Internal aliases — do not edit below this line.
 #define SFTP_DEBUG_ENABLED  LOG_ENABLED
 #define SFTP_DEBUG_TO_FILE  LOG_TO_FILE
-#define SFTP_DEBUG_FILE_PATH LOG_FILE_PATH
 #define SFTP_DEBUG_LEVEL    (LOG_ENABLED ? 2 : 0)
 
 #if SFTP_DEBUG_ENABLED
@@ -94,30 +97,38 @@ inline void sftp_debug_emit_line(const char* line) noexcept
     OutputDebugStringA(line);
     OutputDebugStringA("\n");
 #if SFTP_DEBUG_TO_FILE
-    char logPath[MAX_PATH] = SFTP_DEBUG_FILE_PATH;
-    char dirPath[MAX_PATH] = {};
-    strncpy_s(dirPath, logPath, _TRUNCATE);
-    char* slash = strrchr(dirPath, '\\');
-    if (slash) {
-        *slash = 0;
-        if (dirPath[0])
-            CreateDirectoryA(dirPath, nullptr);
-    }
+    wchar_t logPath[MAX_PATH + 32] = {};
+    const DWORD n = GetTempPathW(MAX_PATH + 1, logPath);
+    if (n == 0 || n > MAX_PATH)
+        return;
+    wcsncat_s(logPath, LOG_FILE_NAME, _TRUNCATE);
 
-    HANDLE hf = CreateFileA(logPath, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hf == INVALID_HANDLE_VALUE) {
-        char tmpDir[MAX_PATH] = {};
-        DWORD n = GetTempPathA((DWORD)countof(tmpDir), tmpDir);
-        if (n > 0 && n < countof(tmpDir) - 20) {
-            strncat_s(tmpDir, "sftpplug_debug.log", _TRUNCATE);
-            hf = CreateFileA(tmpDir, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        }
-    }
+    const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    HANDLE hf = CreateFileW(logPath, FILE_APPEND_DATA, share, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hf != INVALID_HANDLE_VALUE) {
-        SetFilePointer(hf, 0, nullptr, FILE_END);
+        LARGE_INTEGER size{};
+        if (GetFileSizeEx(hf, &size) && size.QuadPart > 20LL * 1024 * 1024) {
+            CloseHandle(hf);
+            wchar_t oldPath[MAX_PATH + 40] = {};
+            wcsncpy_s(oldPath, logPath, _TRUNCATE);
+            wcsncat_s(oldPath, L".old", _TRUNCATE);
+            MoveFileExW(logPath, oldPath, MOVEFILE_REPLACE_EXISTING);
+            hf = CreateFileW(logPath, FILE_APPEND_DATA, share, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (hf == INVALID_HANDLE_VALUE)
+                return;
+        }
+        char buf[1240];
+        const size_t len = strlen(line);
         DWORD written = 0;
-        WriteFile(hf, line, (DWORD)strlen(line), &written, nullptr);
-        WriteFile(hf, "\r\n", 2, &written, nullptr);
+        if (len + 2 <= sizeof(buf)) {
+            memcpy(buf, line, len);
+            buf[len] = '\r';
+            buf[len + 1] = '\n';
+            WriteFile(hf, buf, static_cast<DWORD>(len + 2), &written, nullptr);
+        } else {
+            WriteFile(hf, line, static_cast<DWORD>(len), &written, nullptr);
+            WriteFile(hf, "\r\n", 2, &written, nullptr);
+        }
         CloseHandle(hf);
     }
 #endif

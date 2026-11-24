@@ -59,6 +59,16 @@ const char* GetSourceLabel(SessionSource source) noexcept
 static void ApplyLineCodePageToIni(const char* sectionName, const char* iniFileName, const std::string& lineCodePage);
 static void ApplyEnterSendsCrLfToIni(const char* sectionName, const char* iniFileName, DWORD enterSendsCrLf);
 
+std::string ComposeServerField(const std::string& host, bool hasPort, DWORD port)
+{
+    if (!hasPort || port == 0 || port == 22)
+        return host;
+    // Wrap bare IPv6 literals in brackets so ":port" is not parsed as part of the address.
+    if (host.find(':') != std::string::npos && !host.empty() && host.front() != '[')
+        return std::format("[{}]:{}", host, port);
+    return std::format("{}:{}", host, port);
+}
+
 bool EndsWithI(const std::string& value, const char* suffix) noexcept
 {
     const size_t suffixLen = strlen(suffix);
@@ -299,9 +309,11 @@ bool ImportSessionToIni(const SessionDescriptor& session, LPCSTR iniFileName, bo
     std::string userName;
     ReadRegString(sessionKey, "UserName", userName);
 
-    DWORD useAgent = 0;
-    if (!ReadRegDword(sessionKey, "AgentFwd", useAgent))
-        ReadRegDword(sessionKey, "AuthAgent", useAgent);
+    // TryAgent controls Pageant authentication (enabled by default in PuTTY/WinSCP);
+    // AgentFwd only controls agent forwarding to the remote host.
+    DWORD useAgent = 1;
+    if (!ReadRegDword(sessionKey, "TryAgent", useAgent))
+        useAgent = 1;
 
     std::string publicKeyFile;
     ReadRegString(sessionKey, "PublicKeyFile", publicKeyFile);
@@ -321,9 +333,7 @@ bool ImportSessionToIni(const SessionDescriptor& session, LPCSTR iniFileName, bo
     userName = UrlDecode(userName);
     publicKeyFile = UrlDecode(publicKeyFile);
 
-    std::string serverField = host;
-    if (hasPort && port > 0 && port != 22)
-        serverField += std::format(":{}", port);
+    const std::string serverField = ComposeServerField(host, hasPort, port);
 
     const std::string sectionName = MakeUniqueIniSection(session.displayName, session.source, iniFileName);
     
@@ -545,9 +555,9 @@ bool ImportPortableSessionToIni(const PortableSessionDescriptor& session, LPCSTR
     std::string userName;
     ReadIniString(src, sect, "UserName", userName);
 
-    DWORD useAgent = 0;
-    if (!ReadIniDword(src, sect, "AgentFwd", useAgent))
-        ReadIniDword(src, sect, "AuthAgent", useAgent);
+    DWORD useAgent = 1;
+    if (!ReadIniDword(src, sect, "TryAgent", useAgent))
+        useAgent = 1;
 
     std::string publicKeyFile;
     ReadIniString(src, sect, "PublicKeyFile", publicKeyFile);
@@ -565,9 +575,7 @@ bool ImportPortableSessionToIni(const PortableSessionDescriptor& session, LPCSTR
     userName      = UrlDecode(userName);
     publicKeyFile = UrlDecode(publicKeyFile);
 
-    std::string serverField = host;
-    if (hasPort && port > 0 && port != 22)
-        serverField += std::format(":{}", port);
+    const std::string serverField = ComposeServerField(host, hasPort, port);
 
     const std::string sectionName = MakeUniqueIniSection(session.displayName, session.source, iniFileName);
 
@@ -1192,6 +1200,15 @@ static bool ImportKittySessionToIni(const KittySessionDescriptor& session,
     std::string userName;
     ReadKittyString(session.filePath, "UserName", userName);
 
+    DWORD useAgent = 1;
+    std::string tryAgentStr;
+    if (ReadKittyString(session.filePath, "TryAgent", tryAgentStr)) {
+        char* end = nullptr;
+        unsigned long parsed = strtoul(tryAgentStr.c_str(), &end, 0);
+        if (end && *end == '\0')
+            useAgent = static_cast<DWORD>(parsed);
+    }
+
     std::string publicKeyFile;
     ReadKittyString(session.filePath, "PublicKeyFile", publicKeyFile);
 
@@ -1209,15 +1226,15 @@ static bool ImportKittySessionToIni(const KittySessionDescriptor& session,
         }
     }
 
-    std::string serverField = host;
-    if (hasPort && port > 0 && port != 22)
-        serverField += std::format(":{}", port);
+    const std::string serverField = ComposeServerField(host, hasPort, port);
 
     const std::string sectionName = MakeUniqueIniSection(session.displayName, SessionSource::putty, iniFileName);
 
     WritePrivateProfileStringA(sectionName.c_str(), "server", serverField.c_str(), iniFileName);
     if (!userName.empty())
         WritePrivateProfileStringA(sectionName.c_str(), "user", userName.c_str(), iniFileName);
+    if (useAgent)
+        WritePrivateProfileStringA(sectionName.c_str(), "useagent", "1", iniFileName);
     WritePrivateProfileStringA(sectionName.c_str(), "utf8",           "0", iniFileName);
     WritePrivateProfileStringA(sectionName.c_str(), "unixlinebreaks", "0", iniFileName);
 
@@ -1269,7 +1286,7 @@ static bool ImportKittySessionToIni(const KittySessionDescriptor& session,
         importedData->sectionName = sectionName;
         importedData->server      = serverField;
         importedData->userName    = userName;
-        importedData->useagent    = false;
+        importedData->useagent    = (useAgent != 0);
     }
     return true;
 }

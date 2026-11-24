@@ -32,7 +32,22 @@ struct JumpHostSettings {
     std::string pubkeyfile;
     std::string privkeyfile;
     bool        useagent    = false;
-    std::string fingerprint;   // saved MD5 hex fingerprint (empty = first-time)
+    std::string fingerprint;   // saved SHA256/MD5 hex fingerprint (empty = first-time)
+
+    JumpHostSettings() = default;
+    JumpHostSettings(JumpHostSettings&&) noexcept = default;
+    JumpHostSettings& operator=(JumpHostSettings&&) noexcept = default;
+    JumpHostSettings(const JumpHostSettings&) = delete;
+    JumpHostSettings& operator=(const JumpHostSettings&) = delete;
+
+    ~JumpHostSettings()
+    {
+        if (!password.empty()) {
+            password.resize(password.capacity());
+            SecureZeroMemory(password.data(), password.size());
+            password.clear();
+        }
+    }
 };
 
 // ---------------------------------------------------------------------------

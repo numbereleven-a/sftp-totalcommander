@@ -232,13 +232,18 @@ static INT_PTR CALLBACK JumpHostDlgProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
         SetDlgItemTextA(hWnd, IDC_JUMP_HOST, cs->jump_host.c_str());
         SetDlgItemInt(hWnd, IDC_JUMP_PORT, cs->jump_port ? cs->jump_port : 22, FALSE);
         SetDlgItemTextA(hWnd, IDC_JUMP_USER, cs->jump_user.c_str());
-        SetDlgItemTextA(hWnd, IDC_JUMP_PASSWORD, cs->jump_password.c_str());
+        const bool jumpInStore = cs->jump_cryptpass || cs->jump_password == "\001";
+        SetDlgItemTextA(hWnd, IDC_JUMP_PASSWORD, jumpInStore ? "" : cs->jump_password.c_str());
         SetDlgItemTextA(hWnd, IDC_JUMP_PUBKEY, cs->jump_pubkeyfile.c_str());
         SetDlgItemTextA(hWnd, IDC_JUMP_PRIVKEY, cs->jump_privkeyfile.c_str());
         CheckDlgButton(hWnd, IDC_JUMP_USEAGENT, cs->jump_useagent ? BST_CHECKED : BST_UNCHECKED);
 
-        if (!ctx->hasCryptProc)
+        if (!ctx->hasCryptProc) {
+            CheckDlgButton(hWnd, IDC_JUMP_CRYPTPASS, BST_UNCHECKED);
             EnableWindow(GetDlgItem(hWnd, IDC_JUMP_CRYPTPASS), FALSE);
+        } else {
+            CheckDlgButton(hWnd, IDC_JUMP_CRYPTPASS, jumpInStore ? BST_CHECKED : BST_UNCHECKED);
+        }
 
         UpdateJumpControlStates(hWnd);
 
@@ -259,29 +264,39 @@ static INT_PTR CALLBACK JumpHostDlgProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
         switch (LOWORD(wParam)) {
         case IDOK: {
             pConnectSettings cs = ctx->cs;
+            auto readDlgText = [&](int id) -> std::string {
+                const int len = GetWindowTextLengthA(GetDlgItem(hWnd, id));
+                if (len <= 0)
+                    return {};
+                std::string s(static_cast<size_t>(len) + 1, '\0');
+                const int got = GetDlgItemTextA(hWnd, id, s.data(), static_cast<int>(s.size()));
+                s.resize(got > 0 ? static_cast<size_t>(got) : 0);
+                return s;
+            };
             cs->use_jump_host   = IsDlgButtonChecked(hWnd, IDC_JUMP_ENABLE) == BST_CHECKED;
-
-            std::array<char, MAX_PATH> buf{};
-            GetDlgItemTextA(hWnd, IDC_JUMP_HOST, buf.data(), static_cast<int>(buf.size()) - 1);
-            cs->jump_host = buf.data();
+            cs->jump_host       = readDlgText(IDC_JUMP_HOST);
 
             BOOL portOk = FALSE;
             UINT port = GetDlgItemInt(hWnd, IDC_JUMP_PORT, &portOk, FALSE);
             cs->jump_port = (portOk && port > 0 && port < 65536)
                 ? static_cast<unsigned short>(port) : 22;
 
-            GetDlgItemTextA(hWnd, IDC_JUMP_USER, buf.data(), static_cast<int>(buf.size()) - 1);
-            cs->jump_user = buf.data();
-
-            GetDlgItemTextA(hWnd, IDC_JUMP_PASSWORD, buf.data(), static_cast<int>(buf.size()) - 1);
-            cs->jump_password = buf.data();
-
-            GetDlgItemTextA(hWnd, IDC_JUMP_PUBKEY, buf.data(), static_cast<int>(buf.size()) - 1);
-            cs->jump_pubkeyfile = buf.data();
-
-            GetDlgItemTextA(hWnd, IDC_JUMP_PRIVKEY, buf.data(), static_cast<int>(buf.size()) - 1);
-            cs->jump_privkeyfile = buf.data();
-
+            cs->jump_user       = readDlgText(IDC_JUMP_USER);
+            const bool wasInStore = cs->jump_cryptpass || cs->jump_password == "\001";
+            const bool wantStore  = ctx->hasCryptProc &&
+                IsDlgButtonChecked(hWnd, IDC_JUMP_CRYPTPASS) == BST_CHECKED;
+            std::string typedJumpPass = readDlgText(IDC_JUMP_PASSWORD);
+            if (!typedJumpPass.empty()) {
+                cs->jump_password = typedJumpPass;
+                SecureZeroMemory(typedJumpPass.data(), typedJumpPass.size());
+            } else if (wasInStore && wantStore) {
+                cs->jump_password = "\001";
+            } else {
+                cs->jump_password.clear();
+            }
+            cs->jump_cryptpass  = wantStore;
+            cs->jump_pubkeyfile = readDlgText(IDC_JUMP_PUBKEY);
+            cs->jump_privkeyfile = readDlgText(IDC_JUMP_PRIVKEY);
             cs->jump_useagent = IsDlgButtonChecked(hWnd, IDC_JUMP_USEAGENT) == BST_CHECKED;
 
             // Persist jump host settings to INI.
@@ -297,13 +312,25 @@ static INT_PTR CALLBACK JumpHostDlgProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
                 WritePrivateProfileString(sec, "jumppubkeyfile",  cs->jump_pubkeyfile.c_str(), ini);
                 WritePrivateProfileString(sec, "jumpprivkeyfile", cs->jump_privkeyfile.c_str(), ini);
                 WritePrivateProfileString(sec, "jumpuseagent", cs->jump_useagent ? "1" : "0", ini);
-                // Password: encrypt like main password.
-                if (!cs->jump_password.empty()) {
-                    std::array<char, 1024> enc{};
-                    EncryptString(cs->jump_password.c_str(), enc.data(), static_cast<UINT>(enc.size()));
-                    WritePrivateProfileString(sec, "jumppassword", enc.data(), ini);
+                const std::string storeKey = JumpPasswordStoreName(sec);
+                if (cs->jump_password == "\001") {
+                    WritePrivateProfileString(sec, "jumppassword", "!", ini);
+                } else if (cs->jump_password.empty()) {
+                    if (CryptProc)
+                        CryptProc(PluginNumber, CryptoNumber, FS_CRYPT_DELETE_PASSWORD, storeKey.c_str(), nullptr, 0);
+                    WritePrivateProfileString(sec, "jumppassword", nullptr, ini);
+                } else if (cs->jump_cryptpass && CryptProc) {
+                    const bool ok = CryptProc(PluginNumber, CryptoNumber, FS_CRYPT_SAVE_PASSWORD,
+                                              storeKey.c_str(),
+                                              const_cast<char*>(cs->jump_password.c_str()), 0) == FS_FILE_OK;
+                    WritePrivateProfileString(sec, "jumppassword", ok ? "!" : nullptr, ini);
                 } else {
-                    WritePrivateProfileString(sec, "jumppassword", "", ini);
+                    if (CryptProc)
+                        CryptProc(PluginNumber, CryptoNumber, FS_CRYPT_DELETE_PASSWORD, storeKey.c_str(), nullptr, 0);
+                    std::array<char, 8192> enc{};
+                    EncryptString(cs->jump_password.c_str(), enc.data(), static_cast<UINT>(enc.size()));
+                    WritePrivateProfileString(sec, "jumppassword", enc[0] ? enc.data() : nullptr, ini);
+                    SecureZeroMemory(enc.data(), enc.size());
                 }
             }
 
@@ -2640,10 +2667,21 @@ void ConnectionDialog::OnOk()
         if (!m_settings->jump_privkeyfile.empty())
             WritePrivateProfileString(targetProfile.data(), "jumpprivkeyfile", m_settings->jump_privkeyfile.c_str(), dlgIniFileName);
         WritePrivateProfileString(targetProfile.data(), "jumpuseagent", m_settings->jump_useagent ? "1" : nullptr, dlgIniFileName);
-        if (!m_settings->jump_password.empty()) {
-            std::array<char, 1024> jumpEnc{};
-            EncryptString(m_settings->jump_password.c_str(), jumpEnc.data(), static_cast<UINT>(jumpEnc.size()));
-            WritePrivateProfileString(targetProfile.data(), "jumppassword", jumpEnc.data(), dlgIniFileName);
+        if (m_settings->jump_password == "\001") {
+            WritePrivateProfileString(targetProfile.data(), "jumppassword", "!", dlgIniFileName);
+        } else if (!m_settings->jump_password.empty()) {
+            const std::string jumpStoreKey = JumpPasswordStoreName(targetProfile.data());
+            if (m_settings->jump_cryptpass && CryptProc) {
+                const bool ok = CryptProc(PluginNumber, CryptoNumber, FS_CRYPT_SAVE_PASSWORD,
+                                          jumpStoreKey.c_str(),
+                                          const_cast<char*>(m_settings->jump_password.c_str()), 0) == FS_FILE_OK;
+                WritePrivateProfileString(targetProfile.data(), "jumppassword", ok ? "!" : nullptr, dlgIniFileName);
+            } else {
+                std::array<char, 8192> jumpEnc{};
+                EncryptString(m_settings->jump_password.c_str(), jumpEnc.data(), static_cast<UINT>(jumpEnc.size()));
+                WritePrivateProfileString(targetProfile.data(), "jumppassword", jumpEnc[0] ? jumpEnc.data() : nullptr, dlgIniFileName);
+                SecureZeroMemory(jumpEnc.data(), jumpEnc.size());
+            }
         }
         _itoa_s(m_settings->filemod, modbuf.data(), modbuf.size(), 8);
         WritePrivateProfileString(targetProfile.data(), "filemod", m_settings->filemod == 0644 ? nullptr : modbuf.data(), dlgIniFileName);

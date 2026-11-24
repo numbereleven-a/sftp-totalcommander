@@ -1,5 +1,6 @@
 #include "global.h"
 #include <windows.h>
+#include <algorithm>
 #include <array>
 #include <string>
 #include <format>
@@ -11,6 +12,104 @@
 #include "AuthMethodParser.h"
 #include "ConnectionAuth.h"
 #include "res/resource.h"
+
+namespace {
+
+struct LoginSecretSplit {
+    bool labelled = false;
+    std::string loginPassword;
+    std::string keyPassphrase;
+    ~LoginSecretSplit()
+    {
+        for (std::string* s : { &loginPassword, &keyPassphrase }) {
+            if (!s->empty()) {
+                s->resize(s->capacity());
+                SecureZeroMemory(s->data(), s->size());
+            }
+        }
+    }
+};
+
+LoginSecretSplit SplitLoginSecret(const std::string& stored)
+{
+    LoginSecretSplit out;
+    // Dual-password format: "key_passphrase","login_password"
+    if (stored.size() >= 5 && stored.front() == '"' && stored.back() == '"') {
+        const size_t sep = stored.find("\",\"");
+        if (sep != std::string::npos) {
+            out.labelled      = true;
+            out.keyPassphrase = stored.substr(1, sep - 1);
+            out.loginPassword = stored.substr(sep + 3, stored.size() - sep - 4);
+            return out;
+        }
+    }
+    out.loginPassword = stored;
+    out.keyPassphrase = stored;
+    return out;
+}
+
+void PersistChangedLoginPassword(pConnectSettings cs, const std::string& newLoginPass)
+{
+    if (!cs)
+        return;
+    const LoginSecretSplit old = SplitLoginSecret(cs->password);
+    std::string stored = newLoginPass;
+    if (old.labelled)
+        stored = "\"" + old.keyPassphrase + "\",\"" + newLoginPass + "\"";
+    cs->password = stored;
+
+    if (!cs->DisplayName.empty() && !cs->IniFileName.empty()) {
+        switch (cs->passSaveMode) {
+        case sftp::PassSaveMode::crypt:
+            if (CryptProc) {
+                if (CryptProc(PluginNumber, CryptoNumber, FS_CRYPT_SAVE_PASSWORD,
+                              cs->DisplayName.c_str(), const_cast<char*>(stored.c_str()), 0) != FS_FILE_OK) {
+                    ShowStatus("Password manager refused to save the changed password.");
+                }
+            }
+            break;
+        case sftp::PassSaveMode::plain:
+            if (stored.empty()) {
+                WritePrivateProfileString(cs->DisplayName.c_str(), "password", nullptr, cs->IniFileName.c_str());
+            } else {
+                std::array<char, 8192> szEncryptedPassword{};
+                EncryptString(stored.c_str(), szEncryptedPassword.data(), static_cast<UINT>(szEncryptedPassword.size()));
+                if (szEncryptedPassword[0])
+                    WritePrivateProfileString(cs->DisplayName.c_str(), "password", szEncryptedPassword.data(), cs->IniFileName.c_str());
+                SecureZeroMemory(szEncryptedPassword.data(), szEncryptedPassword.size());
+            }
+            break;
+        default:
+            break;
+        }
+    }
+    if (!stored.empty()) {
+        stored.resize(stored.capacity());
+        SecureZeroMemory(stored.data(), stored.size());
+    }
+}
+
+void CommitAuthPasswords(pConnectSettings cs, bool loggedIn)
+{
+    if (!cs)
+        return;
+    if (loggedIn) {
+        if (!cs->changed_password.empty()) {
+            PersistChangedLoginPassword(cs, cs->changed_password);
+        } else if (!cs->typed_password.empty() && cs->password.empty()) {
+            cs->password = cs->typed_password;
+        }
+    }
+    for (std::string* s : { &cs->typed_password, &cs->changed_password }) {
+        if (!s->empty()) {
+            s->resize(s->capacity());
+            SecureZeroMemory(s->data(), s->size());
+            s->clear();
+        }
+    }
+}
+
+} // namespace
 
 extern "C"
 void newpassfunc(LIBSSH2_SESSION* /*session*/, LPSTR* newpw, int* newpw_len, LPVOID* abstract)
@@ -27,30 +126,19 @@ void newpassfunc(LIBSSH2_SESSION* /*session*/, LPSTR* newpw, int* newpw_len, LPV
         *newpw = nullptr;
     if (newpw_len)
         *newpw_len = 0;
-    if (RequestProc(PluginNumber, RT_Password, title.data(), buf1.data(), newpass.data(), newpass.size()-1)) {
+    const bool answered = RequestProc &&
+        RequestProc(PluginNumber, RT_Password, title.data(), buf1.data(), newpass.data(), newpass.size()-1) != 0;
+    if (PassConnectSettings)
+        PassConnectSettings->authPromptDone = get_sys_ticks();
+    if (answered) {
         size_t bufsize = strlen(newpass.data()) + 1;
         *newpw = static_cast<char*>(malloc(bufsize));
         if (!*newpw)
             return;
         strlcpy(*newpw, newpass.data(), bufsize);
         *newpw_len = (int)strlen(newpass.data());
-        if (PassConnectSettings) {
-            PassConnectSettings->password = newpass.data();
-            switch (PassConnectSettings->passSaveMode) {
-            case sftp::PassSaveMode::crypt:
-                CryptProc(PluginNumber, CryptoNumber, FS_CRYPT_SAVE_PASSWORD, PassConnectSettings->DisplayName.c_str(), newpass.data(), 0);
-                break;
-            case sftp::PassSaveMode::plain:
-                if (newpass[0] == 0) {
-                    WritePrivateProfileString(PassConnectSettings->DisplayName.c_str(), "password", nullptr, PassConnectSettings->IniFileName.c_str());
-                } else {
-                    std::array<char, 8192> szEncryptedPassword{};
-                    EncryptString(newpass.data(), szEncryptedPassword.data(), szEncryptedPassword.size());
-                    if (szEncryptedPassword[0]) WritePrivateProfileString(PassConnectSettings->DisplayName.c_str(), "password", szEncryptedPassword.data(), PassConnectSettings->IniFileName.c_str());
-                }
-                break;
-            }
-        }
+        if (PassConnectSettings)
+            PersistChangedLoginPassword(PassConnectSettings, newpass.data());
     }
 }
 
@@ -143,29 +231,39 @@ int PerformAuthentication(
         }
     }
 
+    ConnectSettings->key_passphrase_used = false;
+    ConnectSettings->authPromptDone = 0;
+
     int auth = 0;
+    bool triedPubkey = false;
     if (ConnectSettings->session->userauthAuthenticated()) {
         ShowStatusId(IDS_LOG_AUTH_NO_PASSWORD, nullptr, true);
-    } else if ((auth_pw & SSH_AUTH_PUBKEY) && ConnectSettings->useagent && agentAvailable) {
-        progress = 65;
-        int rc = SftpAuthPageant(ConnectSettings, progressbuf, progress, &loop, &lasttime, &auth_pw);
-        auth = (rc < 0) ? LIBSSH2_ERROR_AGENT_PROTOCOL : 0;
-        const std::string status = std::format("Pageant: rc={} auth={}", rc, auth);
-        ShowStatus(status.c_str());
-    } else if ((auth_pw & SSH_AUTH_PUBKEY) && ConnectSettings->privkeyfile[0]) {
-        progress = 65;
-        if (LogProc) LogProc(PluginNumber, MSGTYPE_DETAILS, "=== Calling SftpAuthPubKey ===");
-        int rc = SftpAuthPubKey(ConnectSettings, progressbuf, progress, &loop, &lasttime, &auth_pw);
-        auth = (rc < 0) ? LIBSSH2_ERROR_FILE : 0;
-        if (rc == -LIBSSH2_ERROR_FILE) {
-            SFTP_LOG("CONN", "Public-key auth aborted due to local key file error.");
-            return SFTP_FAILED;
-        }
-        if (LogProc) LogProc(PluginNumber, MSGTYPE_DETAILS, "=== SftpAuthPubKey returned ===");
-        const std::string status = std::format("PubKey: rc={} auth={} pw=0x{:x}", rc, auth, auth_pw);
-        ShowStatus(status.c_str());
     } else {
-        auth_pw &= ~SSH_AUTH_PUBKEY;
+        if ((auth_pw & SSH_AUTH_PUBKEY) && ConnectSettings->useagent && agentAvailable) {
+            triedPubkey = true;
+            progress = 65;
+            int rc = SftpAuthPageant(ConnectSettings, progressbuf, progress, &loop, &lasttime, &auth_pw);
+            auth = (rc < 0) ? LIBSSH2_ERROR_AGENT_PROTOCOL : 0;
+            const std::string status = std::format("Pageant: rc={} auth={}", rc, auth);
+            ShowStatus(status.c_str());
+        }
+        // Try configured key file even when useagent is enabled if Pageant did not authenticate.
+        if ((!triedPubkey || auth != 0) && (auth_pw & SSH_AUTH_PUBKEY) && !ConnectSettings->privkeyfile.empty()) {
+            triedPubkey = true;
+            progress = 65;
+            if (LogProc) LogProc(PluginNumber, MSGTYPE_DETAILS, "=== Calling SftpAuthPubKey ===");
+            int rc = SftpAuthPubKey(ConnectSettings, progressbuf, progress, &loop, &lasttime, &auth_pw);
+            auth = (rc < 0) ? LIBSSH2_ERROR_FILE : 0;
+            if (rc == -LIBSSH2_ERROR_FILE) {
+                SFTP_LOG("CONN", "Public-key auth aborted due to local key file error.");
+                return SFTP_FAILED;
+            }
+            if (LogProc) LogProc(PluginNumber, MSGTYPE_DETAILS, "=== SftpAuthPubKey returned ===");
+            const std::string status = std::format("PubKey: rc={} auth={} pw=0x{:x}", rc, auth, auth_pw);
+            ShowStatus(status.c_str());
+        }
+        if (!triedPubkey)
+            auth_pw &= ~SSH_AUTH_PUBKEY;
     }
 
     if (LogProc) LogProc(PluginNumber, MSGTYPE_DETAILS, "=== Auth section done ===");
@@ -174,12 +272,10 @@ int PerformAuthentication(
         if (LogProc) LogProc(PluginNumber, MSGTYPE_DETAILS, "Trying password/keyboard auth fallback");
         const bool canKeyboardAuth = (auth_pw & SSH_AUTH_KEYBOARD) != 0;
         const bool canPasswordAuth = (auth_pw & SSH_AUTH_PASSWORD) != 0;
-        // If the probe was done and confirmed password auth, try it first to avoid
-        // consuming keyboard-interactive attempts on OTP/MFA prompts.
-        // When probe was skipped we don't know the server's supported methods,
-        // so keyboard-interactive goes first; kbd_callback will auto-send the
-        // stored password for password-like prompts (e.g. OVH).
-        const bool preferPasswordFirst = !skipProbe && canPasswordAuth && ConnectSettings->password[0] != 0;
+        const LoginSecretSplit storedSecret = SplitLoginSecret(ConnectSettings->password);
+        const bool hasLoginPassword = !storedSecret.loginPassword.empty() &&
+                                      (!ConnectSettings->key_passphrase_used || storedSecret.labelled);
+        const bool preferPasswordFirst = !skipProbe && canPasswordAuth && hasLoginPassword;
         bool skippedKeyboardFirst = false;
 
         if (canKeyboardAuth && !preferPasswordFirst) {
@@ -191,7 +287,7 @@ int PerformAuthentication(
             int kbdIter = 0;
             while ((auth = cs->session->userauthKeyboardInteractive(cs->user.c_str(), (unsigned)cs->user.size(), &kbd_callback)) == LIBSSH2_ERROR_EAGAIN) {
                 const int dirs = cs->session->blockDirections();
-                const DWORD elapsed = (DWORD)get_ticks_between(authStart);
+                const DWORD elapsed = (DWORD)get_ticks_between((std::max)(authStart, cs->authPromptDone));
                 SFTP_LOG("AUTH", "kbd EAGAIN #%d dirs=0x%x elapsed=%u cbSent=%d", ++kbdIter, dirs, elapsed, cs->InteractivePasswordSent ? 1 : 0);
                 if (ProgressLoop(buf.data(), progress, progress + 10, &loop, &lasttime))
                     break;
@@ -202,6 +298,7 @@ int PerformAuthentication(
                 WaitForSshIo(cs);
             }
             SFTP_LOG("AUTH", "kbd done auth=%d iters=%d cbSent=%d", auth, kbdIter, ConnectSettings->InteractivePasswordSent ? 1 : 0);
+            CommitAuthPasswords(ConnectSettings, auth == 0);
             if (auth) {
                 SftpLogLastError("libssh2_userauth_keyboard_interactive: ", auth);
                 if ((auth_pw & SSH_AUTH_PASSWORD) == 0)
@@ -211,72 +308,108 @@ int PerformAuthentication(
             auth = LIBSSH2_ERROR_INVAL;
             skippedKeyboardFirst = canKeyboardAuth;
         }
-        if (auth != 0 && canPasswordAuth) {
-            std::string passphrase;
-            const char* passwordCStr = ConnectSettings->password.c_str();
-            const char* p = strstr(passwordCStr, "\",\"");
-            size_t len = ConnectSettings->password.size();
-            if (p && !ConnectSettings->password.empty() && ConnectSettings->password.front() == '"' && ConnectSettings->password.back() == '"') {
-                passphrase = std::string(p + 3, (passwordCStr + len - 1) - (p + 3));
-            } else {
-                passphrase = ConnectSettings->password;
-            }
-            if (passphrase.empty()) {
-                std::string title = std::format("SFTP password for {}@{}", ConnectSettings->user, ConnectSettings->server);
-                if (ConnectSettings->feedback) {
-                    ConnectSettings->feedback->RequestText(title, "", passphrase, true);
-                } else {
-                    std::array<char, 256> tmpBuf{};
-                    RequestProc(PluginNumber, RT_Password, title.c_str(), nullptr, tmpBuf.data(), tmpBuf.size()-1);
-                    passphrase = tmpBuf.data();
-                }
-            }
 
-            ShowStatusId(IDS_AUTH_PASSWORD_FOR, ConnectSettings->user.c_str(), true);
-            LoadStr(buf, IDS_AUTH_PASSWORD);
-            const SYSTICKS authStart = get_sys_ticks();
-            int passIter = 0;
-            while (1) {
-                auth = ConnectSettings->session->userauthPassword(ConnectSettings->user.c_str(), (unsigned)ConnectSettings->user.size(), passphrase.c_str(), (unsigned)passphrase.length(), &newpassfunc);
-                if (auth != LIBSSH2_ERROR_EAGAIN && auth != LIBSSH2_ERROR_PASSWORD_EXPIRED)
-                    break;
-                if (auth == LIBSSH2_ERROR_EAGAIN) {
-                    const int dirs = ConnectSettings->session->blockDirections();
-                    const DWORD elapsed = (DWORD)get_ticks_between(authStart);
-                    SFTP_LOG("AUTH", "pass EAGAIN #%d dirs=0x%x elapsed=%u", ++passIter, dirs, elapsed);
-                    if (ProgressLoop(buf.data(), progress, progress + 10, &loop, &lasttime))
+        // Do not resend a stored password that keyboard-interactive already had refused.
+        bool storedRefused = auth != 0 && !skippedKeyboardFirst && canKeyboardAuth &&
+                             ConnectSettings->InteractivePasswordSent;
+        bool cancelled = false;
+
+        if (auth != 0 && canPasswordAuth) {
+            std::string passphrase = (!storedRefused && hasLoginPassword) ? storedSecret.loginPassword : std::string();
+            struct WipePass {
+                std::string& s;
+                ~WipePass() {
+                    if (!s.empty()) {
+                        s.resize(s.capacity());
+                        SecureZeroMemory(s.data(), s.size());
+                        s.clear();
+                    }
+                }
+            } wipePass{passphrase};
+            bool typed = false;
+            for (int typedTries = 0; ; ) {
+                if (passphrase.empty()) {
+                    if (typedTries >= 3)
                         break;
+                    ++typedTries;
+                    std::string title = std::format("SFTP password for {}@{}", ConnectSettings->user, ConnectSettings->server);
+                    bool answered = false;
+                    if (ConnectSettings->feedback) {
+                        answered = ConnectSettings->feedback->RequestText(title, "", passphrase, true);
+                    } else if (RequestProc) {
+                        std::array<char, 256> tmpBuf{};
+                        answered = RequestProc(PluginNumber, RT_Password, title.c_str(), nullptr, tmpBuf.data(), tmpBuf.size()-1) != 0;
+                        if (answered)
+                            passphrase = tmpBuf.data();
+                        SecureZeroMemory(tmpBuf.data(), tmpBuf.size());
+                    }
+                    ConnectSettings->authPromptDone = get_sys_ticks();
+                    if (!answered) {
+                        auth = LIBSSH2_ERROR_AUTHENTICATION_FAILED;
+                        cancelled = true;
+                        break;
+                    }
+                    typed = true;
+                }
+
+                ShowStatusId(IDS_AUTH_PASSWORD_FOR, ConnectSettings->user.c_str(), true);
+                LoadStr(buf, IDS_AUTH_PASSWORD);
+                const SYSTICKS authStart = get_sys_ticks();
+                int passIter = 0;
+                // PASSWORD_EXPIRED is final when user cancels the change dialog — never re-enter libssh2.
+                while (1) {
+                    auth = ConnectSettings->session->userauthPassword(ConnectSettings->user.c_str(), (unsigned)ConnectSettings->user.size(), passphrase.c_str(), (unsigned)passphrase.length(), &newpassfunc);
+                    if (auth != LIBSSH2_ERROR_EAGAIN)
+                        break;
+                    const int dirs = ConnectSettings->session->blockDirections();
+                    const DWORD elapsed = (DWORD)get_ticks_between((std::max)(authStart, ConnectSettings->authPromptDone));
+                    SFTP_LOG("AUTH", "pass EAGAIN #%d dirs=0x%x elapsed=%u", ++passIter, dirs, elapsed);
+                    if (ProgressLoop(buf.data(), progress, progress + 10, &loop, &lasttime)) {
+                        cancelled = true;
+                        break;
+                    }
                     if (elapsed > SSH_AUTH_STAGE_TIMEOUT_MS) {
                         ShowStatusId(IDS_LOG_PASS_AUTH_TIMEOUT, nullptr, true);
                         break;
                     }
                     WaitForSshIo(ConnectSettings);
                 }
-            }
-            SFTP_LOG("AUTH", "pass done auth=%d iters=%d", auth, passIter);
-            if (auth) {
+                SFTP_LOG("AUTH", "pass done auth=%d iters=%d", auth, passIter);
+                if (auth == 0) {
+                    if (ConnectSettings->password.empty())
+                        ConnectSettings->password = passphrase;
+                    break;
+                }
                 SftpLogLastError("libssh2_userauth_password_ex: ", auth);
+                if (!typed)
+                    storedRefused = true;
+                passphrase.resize(passphrase.capacity());
+                SecureZeroMemory(passphrase.data(), passphrase.size());
+                passphrase.clear();
+                if (cancelled || auth != LIBSSH2_ERROR_AUTHENTICATION_FAILED)
+                    break;
+            }
+            if (auth && !cancelled) {
                 if (!skippedKeyboardFirst)
                     ShowErrorId(IDS_ERR_AUTH_PASSWORD);
                 else
                     ShowStatusId(IDS_ERR_AUTH_PASSWORD, nullptr, true);
-            } else if (ConnectSettings->password.empty()) {
-                ConnectSettings->password = passphrase;
             }
         }
 
-        if (auth != 0 && skippedKeyboardFirst) {
+        if (auth != 0 && skippedKeyboardFirst && !cancelled) {
             // Retry keyboard-interactive after password failure for servers that expose
             // both methods but only accept one depending on account policy.
             ShowStatusId(IDS_AUTH_KEYBDINT_FOR, ConnectSettings->user.c_str(), true);
             LoadStr(buf, IDS_AUTH_KEYBDINT);
             pConnectSettings cs = ConnectSettings;
-            cs->InteractivePasswordSent = false;
+            // Do not auto-resend a stored password already refused by password auth.
+            cs->InteractivePasswordSent = storedRefused;
             const SYSTICKS authStart = get_sys_ticks();
             int kbdIter2 = 0;
             while ((auth = cs->session->userauthKeyboardInteractive(cs->user.c_str(), (unsigned)cs->user.size(), &kbd_callback)) == LIBSSH2_ERROR_EAGAIN) {
                 const int dirs = cs->session->blockDirections();
-                const DWORD elapsed = (DWORD)get_ticks_between(authStart);
+                const DWORD elapsed = (DWORD)get_ticks_between((std::max)(authStart, cs->authPromptDone));
                 SFTP_LOG("AUTH", "kbd2 EAGAIN #%d dirs=0x%x elapsed=%u cbSent=%d", ++kbdIter2, dirs, elapsed, cs->InteractivePasswordSent ? 1 : 0);
                 if (ProgressLoop(buf.data(), progress, progress + 10, &loop, &lasttime))
                     break;
@@ -287,6 +420,7 @@ int PerformAuthentication(
                 WaitForSshIo(cs);
             }
             SFTP_LOG("AUTH", "kbd2 done auth=%d iters=%d cbSent=%d", auth, kbdIter2, ConnectSettings->InteractivePasswordSent ? 1 : 0);
+            CommitAuthPasswords(ConnectSettings, auth == 0);
             if (auth) {
                 SftpLogLastError("libssh2_userauth_keyboard_interactive: ", auth);
                 ShowErrorId(IDS_ERR_AUTH_KEYBDINT);

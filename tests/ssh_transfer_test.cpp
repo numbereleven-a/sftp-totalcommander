@@ -3,12 +3,15 @@
 #include "Libssh2Backend.h"
 #include "PluginEntryPointsInternal.h"
 #include "ScpTransfer.h"
+#include "TransferUtils.h"
 #include "PhpAgentClient.h"
 #include "PhpRequestSigning.h"
 #include "IUserFeedback.h"
 #include "ProxyNegotiator.h"
 #include "ServerRegistry.h"
 #include "CoreUtils.h"
+#include "ProfileSettings.h"
+#include "core/KittyDecrypt.h"
 #include "IsolatedAppData.h"
 #include <filesystem>
 #include <fstream>
@@ -176,7 +179,178 @@ void terminalControls() {
             worker.join();
             check(rc == 0, "SOCKS5 ATYP=3 domain length >= 128 decodes as unsigned");
         }
+
+        // 3) myrecv returns 0 immediately on peer EOF instead of spinning until timeout.
+        {
+            auto [cli, worker] = startLoopbackMock([](SOCKET c) {
+                shutdown(c, SD_SEND);
+            });
+            SetBlockingSocket(cli, false);
+            char buf[16]{};
+            int loop = 0;
+            SYSTICKS last = get_sys_ticks();
+            const auto t0 = std::chrono::steady_clock::now();
+            const int rc = myrecv(cli, buf, sizeof(buf), 0, "recv", 0, &loop, &last);
+            const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            closesocket(cli);
+            worker.join();
+            check(rc == 0 && elapsedMs < 2000, "myrecv returns 0 promptly on peer EOF");
+        }
         WSACleanup();
+    }
+
+    // Shell safety, random markers, split echo, and remote entry name filtering.
+    {
+        check(ShellCommandIsSafe("/home/user/file name-1.txt") &&
+              !ShellCommandIsSafe("/home/user/bad\nname") &&
+              !ShellCommandIsSafe("/home/user/bad\x1bname") &&
+              !ShellCommandIsSafe("/home/user/bad\x7fname"),
+              "ShellCommandIsSafe rejects control characters");
+
+        const std::string m1 = ShellMarker("__WFX_TEST__");
+        const std::string m2 = ShellMarker("__WFX_TEST__");
+        const std::string echoCmd = ShellEchoMarker(m1);
+        check(m1 != m2 && m1.size() > 20 &&
+              echoCmd.find(m1) == std::string::npos &&
+              echoCmd.find("\"\"") != std::string::npos,
+              "ShellMarker is randomized and ShellEchoMarker splits marker literal");
+
+        check(RemoteEntryNameIsSafeW(L"normal file.txt") &&
+              !RemoteEntryNameIsSafeW(L"") &&
+              !RemoteEntryNameIsSafeW(L"dir\\evil.txt") &&
+              !RemoteEntryNameIsSafeW(L"dir/evil.txt") &&
+              !RemoteEntryNameIsSafeW(L"ctrl\x01name"),
+              "RemoteEntryNameIsSafeW rejects path separators and control chars");
+    }
+
+    // Local filename sanitization (invalid chars, trailing dot/space, Windows reserved devices).
+    {
+        auto sanitize = [](std::wstring p) {
+            SanitizeLocalFileNameW(p.data());
+            return p;
+        };
+        check(sanitize(L"C:\\dir\\a<b>c.txt") == L"C:\\dir\\a_b_c.txt" &&
+              sanitize(L"C:\\dir\\trail.") == L"C:\\dir\\trail_" &&
+              sanitize(L"C:\\dir\\space ") == L"C:\\dir\\space_" &&
+              sanitize(L"C:\\dir\\CON") == L"C:\\dir\\CO_" &&
+              sanitize(L"C:\\dir\\nul.txt") == L"C:\\dir\\nu_.txt" &&
+              sanitize(L"C:\\dir\\COM1.log") == L"C:\\dir\\COM_.log" &&
+              sanitize(L"C:\\dir\\LPT9") == L"C:\\dir\\LPT_" &&
+              sanitize(L"C:\\dir\\normal.txt") == L"C:\\dir\\normal.txt",
+              "SanitizeLocalFileNameW neutralizes unsafe chars and Windows device names");
+    }
+
+    // Long path (> 260 chars) end-to-end test via CreateDirectoryT / CreateFileT /
+    // GetFileAttributesExT / MoveFileExT / DeleteFileT.
+    {
+        std::array<WCHAR, MAX_PATH> tmpDir{};
+        GetTempPathW(static_cast<DWORD>(tmpDir.size()), tmpDir.data());
+        std::wstring base = std::wstring(tmpDir.data()) + L"sftp_lp_" + std::to_wstring(GetCurrentProcessId());
+        CreateDirectoryT(base.c_str(), nullptr);
+        std::vector<std::wstring> dirs{base};
+        std::wstring cur = base;
+        for (int i = 0; i < 6; ++i) {
+            cur += L"\\" + std::wstring(45, static_cast<wchar_t>(L'a' + i));
+            CreateDirectoryT(cur.c_str(), nullptr);
+            dirs.push_back(cur);
+        }
+        const std::wstring f1 = cur + L"\\staged_source.txt";
+        const std::wstring f2 = cur + L"\\final_target.txt";
+        HANDLE h = CreateFileT(f1.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        bool okCreate = (h != INVALID_HANDLE_VALUE);
+        if (okCreate) {
+            DWORD wr = 0;
+            WriteFile(h, "longpath", 8, &wr, nullptr);
+            CloseHandle(h);
+        }
+        WIN32_FILE_ATTRIBUTE_DATA attr1{};
+        const bool okAttr1 = GetFileAttributesExT(f1.c_str(), &attr1) != 0 && attr1.nFileSizeLow == 8;
+        const bool okMove = MoveFileExT(f1.c_str(), f2.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+        WIN32_FILE_ATTRIBUTE_DATA attr2{};
+        const bool okAttr2 = GetFileAttributesExT(f2.c_str(), &attr2) != 0 && attr2.nFileSizeLow == 8;
+        const bool okDel = DeleteFileT(f2.c_str()) != 0;
+        for (auto it = dirs.rbegin(); it != dirs.rend(); ++it)
+            RemoveDirectoryT(it->c_str());
+        check(f2.size() > 260 && okCreate && okAttr1 && okMove && okAttr2 && okDel,
+              "long-path *T file helpers create, stat, MoveFileExT, and delete >260-char paths");
+    }
+
+    // MimeEncodeData handles 1/2/3-byte tail lengths without reading past input end.
+    {
+        char out[32]{};
+        const char d1[1] = {'M'};
+        const char d2[2] = {'M', 'a'};
+        const char d3[3] = {'M', 'a', 'n'};
+        MimeEncodeData(d1, 1, out, sizeof(out));
+        const bool ok1 = (std::string(out) == "TQ==");
+        MimeEncodeData(d2, 2, out, sizeof(out));
+        const bool ok2 = (std::string(out) == "TWE=");
+        MimeEncodeData(d3, 3, out, sizeof(out));
+        const bool ok3 = (std::string(out) == "TWFu");
+        check(ok1 && ok2 && ok3, "MimeEncodeData encodes 1/2/3-byte groups accurately");
+    }
+
+    // KittyDecrypt rejects wrong-key garbage via printable ASCII check.
+    {
+        std::string plain;
+        // 32 hex chars (16 random-looking ciphertext bytes) with wrong host/termtype must fail LooksTyped().
+        const bool decWrong = DecryptKittyPassword("00112233445566778899aabbccddeeff", "wrong.invalid", "xterm", plain);
+        check(!decWrong && plain.empty(), "KittyDecrypt rejects control-byte garbage on wrong key");
+    }
+
+    // ProfileSettings: dynamic INI reads (> MAX_PATH), useagent=1 keeps password,
+    // invalid filemod/dirmod fallback, jumppassword=! sets jump_cryptpass.
+    {
+        std::array<char, MAX_PATH> tmpDir{};
+        GetTempPathA(static_cast<DWORD>(tmpDir.size()), tmpDir.data());
+        const std::string ini = std::string(tmpDir.data()) + "sftp_prof_test_" + std::to_string(GetCurrentProcessId()) + ".ini";
+        DeleteFileA(ini.c_str());
+
+        const std::string longCmd = "/usr/libexec/" + std::string(310, 's') + "/sftp-server";
+        std::array<char, 512> encPw{};
+        EncryptString("kept-secret", encPw.data(), static_cast<UINT>(encPw.size()));
+        WritePrivateProfileStringA("prof1", "server", "example.invalid", ini.c_str());
+        WritePrivateProfileStringA("prof1", "user", "alice", ini.c_str());
+        WritePrivateProfileStringA("prof1", "useagent", "1", ini.c_str());
+        WritePrivateProfileStringA("prof1", "password", encPw.data(), ini.c_str());
+        WritePrivateProfileStringA("prof1", "sftpservercommand", longCmd.c_str(), ini.c_str());
+        WritePrivateProfileStringA("prof1", "filemod", "badmode", ini.c_str());
+        WritePrivateProfileStringA("prof1", "dirmod", "999", ini.c_str());
+        WritePrivateProfileStringA("prof1", "usejumphost", "1", ini.c_str());
+        WritePrivateProfileStringA("prof1", "jumphost", "bastion.invalid", ini.c_str());
+        WritePrivateProfileStringA("prof1", "jumppassword", "!", ini.c_str());
+
+        tConnectSettings loaded{};
+        const bool ok = LoadServerSettings("prof1", &loaded, ini.c_str());
+        DeleteFileA(ini.c_str());
+        check(ok &&
+              loaded.sftpservercommand == longCmd &&
+              loaded.useagent &&
+              loaded.password == "kept-secret" &&
+              loaded.filemod == 0644 &&
+              loaded.dirmod == 0755 &&
+              loaded.jump_cryptpass &&
+              loaded.jump_password == "\001" &&
+              JumpPasswordStoreName("prof1") == "prof1:jump",
+              "LoadServerSettings supports >MAX_PATH fields, useagent+password, octal fallback, and jump cryptpass");
+    }
+
+    // Unsupported Proxy + Jump Host combination is explicitly refused instead of bypassing proxy.
+    {
+        FsInit(42, progress, logMessage, request);
+        tConnectSettings combo{};
+        combo.sock = INVALID_SOCKET;
+        combo.server = "127.0.0.1";
+        combo.customport = 22;
+        combo.user = "synthetic";
+        combo.proxynr = 1;
+        combo.proxytype = sftp::Proxy::socks5;
+        combo.proxyserver = "127.0.0.1:1080";
+        combo.use_jump_host = true;
+        combo.jump_host = "127.0.0.1";
+        combo.jump_port = 2222;
+        check(SftpConnect(&combo) == -26, "SftpConnect refuses unsupported Proxy + Jump Host combination");
     }
 }
 std::string readFile(const std::filesystem::path& path) {
@@ -234,11 +408,45 @@ void authPrompts() {
     text = "Password:"; prompt.text = reinterpret_cast<unsigned char*>(text.data()); prompt.length = static_cast<unsigned>(text.size());
     response = "synthetic-pass";
     kbd_callback(nullptr, 0, nullptr, 0, 1, &prompt, &result, &context);
-    check(cs.password == response, "password answer remains available for reconnect");
+    check(cs.password.empty() && cs.typed_password == response && result.text && response == result.text,
+          "typed keyboard-interactive password is held until login succeeds");
     free(result.text);
+
+    // "New password:" must never auto-send stored password and stores typed value in changed_password.
+    {
+        tConnectSettings ncs{};
+        ncs.password = "old-secret";
+        void* nctx = &ncs;
+        std::string newPrompt = "New password:";
+        prompt.text = reinterpret_cast<unsigned char*>(newPrompt.data());
+        prompt.length = static_cast<unsigned>(newPrompt.size());
+        response = "new-secret";
+        kbd_callback(nullptr, 0, nullptr, 0, 1, &prompt, &result, &nctx);
+        check(result.text && std::string(result.text) == "new-secret" &&
+              ncs.changed_password == "new-secret" && ncs.password == "old-secret",
+              "New password prompt never auto-sends stored secret and captures changed_password");
+        free(result.text);
+    }
+
+    // When unlabelled stored password unlocked a key, do not reuse it as login password.
+    {
+        tConnectSettings kcs{};
+        kcs.password = "key-only-pass";
+        kcs.key_passphrase_used = true;
+        void* kctx = &kcs;
+        text = "Password:";
+        prompt.text = reinterpret_cast<unsigned char*>(text.data());
+        prompt.length = static_cast<unsigned>(text.size());
+        response = "account-pass";
+        kbd_callback(nullptr, 0, nullptr, 0, 1, &prompt, &result, &kctx);
+        check(result.text && std::string(result.text) == "account-pass" && kcs.typed_password == "account-pass",
+              "key_passphrase_used prevents reusing unlabelled key passphrase for login");
+        free(result.text);
+    }
 
     tConnectSettings qcs{};
     qcs.password = "\"firstpw\",\"secondpw\"";
+    qcs.key_passphrase_used = true;
     void* qctx = &qcs;
     kbd_callback(nullptr, 0, nullptr, 0, 1, &prompt, &result, &qctx);
     check(result.text && std::string(result.text) == "secondpw",
@@ -258,6 +466,28 @@ void imports(const std::filesystem::path& root) {
         check(mode == 0 ? ok && !unsupported : !ok && unsupported,
               mode == 0 ? "direct portable session imports" : mode == 1 ? "proxy import refuses a direct connection" : "tunnel import refuses a direct connection");
     }
+
+    // IPv6 host + custom port wraps literal IPv6 in brackets, and TryAgent controls useagent (default 1).
+    writeFile(input, "[ipv6sess]\r\nHostName=2001:db8::1\r\nPortNumber=2222\r\nTryAgent=0\r\n");
+    WritePrivateProfileStringA(nullptr, nullptr, nullptr, input.c_str());
+    PortableSessionDescriptor ipv6Desc{SessionSource::putty, input, "ipv6sess", "ipv6sess"};
+    ImportedSessionData ipv6Data{};
+    bool unsup6 = false;
+    const bool ok6 = ImportPortableSessionToIni(ipv6Desc, output.c_str(), unsup6, &ipv6Data);
+    const std::string srv6 = ::ReadIniString(ipv6Data.sectionName.c_str(), "server", "", output.c_str());
+    const int agent6 = GetPrivateProfileIntA(ipv6Data.sectionName.c_str(), "useagent", 0, output.c_str());
+
+    writeFile(input, "[agentdef]\r\nHostName=example.invalid\r\n");
+    WritePrivateProfileStringA(nullptr, nullptr, nullptr, input.c_str());
+    PortableSessionDescriptor defDesc{SessionSource::putty, input, "agentdef", "agentdef"};
+    ImportedSessionData defData{};
+    bool unsupDef = false;
+    const bool okDef = ImportPortableSessionToIni(defDesc, output.c_str(), unsupDef, &defData);
+    const int agentDef = GetPrivateProfileIntA(defData.sectionName.c_str(), "useagent", 0, output.c_str());
+
+    check(ok6 && !unsup6 && srv6 == "[2001:db8::1]:2222" && agent6 == 0 && !ipv6Data.useagent &&
+          okDef && !unsupDef && agentDef == 1 && defData.useagent,
+          "session import brackets IPv6 host:port and honors TryAgent");
 }
 }
 
@@ -321,6 +551,31 @@ int wmain(int argc, wchar_t** argv) {
     Global_TransferMode = 'I';
     check(SftpDownloadFileW(cs, L"/short.bin", download.c_str(), true, 100, nullptr, false) != SFTP_OK,
           "truncated download is not successful");
+    // Staged atomic overwrite: failed download onto pre-existing local file preserves original contents.
+    {
+        const auto keepPath = root / "keep_existing.bin";
+        writeFile(keepPath, "original-content");
+        const int dlRc = SftpDownloadFileW(cs, L"/definitely-missing.bin", keepPath.c_str(), true, 16, nullptr, false);
+        info.Size64 = 16;
+        const int fsRc = FsGetFileW(L"\\synthetic\\definitely-missing.bin", const_cast<wchar_t*>(keepPath.c_str()),
+                                    FS_COPYFLAGS_OVERWRITE, &info);
+        check(dlRc != SFTP_OK && fsRc == FS_FILE_READERROR && readFile(keepPath) == "original-content",
+              "failed overwrite download preserves pre-existing local file");
+    }
+    // SFTP F6 rename with Overwrite=true onto an existing target succeeds via posix-rename/unlink fallback.
+    {
+        const auto r1 = root / "ren1.bin";
+        const auto r2 = root / "ren2.bin";
+        writeFile(r1, "new-payload");
+        writeFile(r2, "old-payload");
+        check(SftpUploadFileW(cs, r1.c_str(), L"/ren_src.bin", false, false) == SFTP_OK &&
+              SftpUploadFileW(cs, r2.c_str(), L"/ren_dst.bin", false, false) == SFTP_OK &&
+              SftpRenameMoveFileW(cs, L"/ren_src.bin", L"/ren_dst.bin", true, true, false) == SFTP_OK &&
+              SftpFileExistsW(cs, L"/ren_src.bin") == 0 &&
+              SftpDownloadFileW(cs, L"/ren_dst.bin", download.c_str(), true, 11, nullptr, false) == SFTP_OK &&
+              readFile(download) == "new-payload",
+              "SFTP rename with Overwrite replaces existing destination");
+    }
     info.Size64 = 100;
     check(FsGetFileW(L"\\synthetic\\short.bin", const_cast<wchar_t*>(download.c_str()), FS_COPYFLAGS_OVERWRITE, &info) == FS_FILE_READERROR,
           "automatic resume stops when a retry adds no data");
@@ -362,6 +617,20 @@ int wmain(int argc, wchar_t** argv) {
     writeFile(shellScp, bytes.substr(0, 3));
     check(SftpUploadFileW(shell, local.c_str(), shellScp.c_str(), true, false) == SFTP_OK && readFile(shellScp) == bytes,
           "raw shell upload resumes and checks completion");
+    // Unreadable/missing remote file in raw shell fallback must fail AND not poison shell_dd_b64only.
+    {
+        shell->shell_transfer_force = false;
+        shell->shell_transfer_dd = true;
+        shell->shell_dd_b64only = false;
+        int64_t ddLoaded = 0;
+        const auto missFile = shellRoot / "no-such-shell-file.bin";
+        HANDLE hTmp = CreateFileW(download.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        const int missRc = ShellDdDownloadFile(shell, ToRemotePathA(shell, missFile.c_str()), missFile.c_str(),
+                                               hTmp, download.c_str(), 10, 0, &ddLoaded, false);
+        CloseHandle(hTmp);
+        check(missRc != SFTP_OK && !shell->shell_dd_b64only,
+              "failed raw shell download reports error without poisoning shell_dd_b64only");
+    }
     shell->shell_transfer_force = true; shell->shell_transfer_dd = true;
     const auto special = shellRoot / "space '; special.bin";
     check(SftpUploadFileW(shell, local.c_str(), special.c_str(), false, false) == SFTP_OK && readFile(special) == bytes,

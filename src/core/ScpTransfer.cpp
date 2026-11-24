@@ -99,7 +99,8 @@ public:
     bool ReadByte(char& out, DWORD timeoutMs) {
         return ScpWaitFor(cs_, false, timeoutMs, [&] {
             int r = static_cast<int>(channel_->read(&out, 1));
-            return r == 1 ? 1 : r;
+            // EOF (r == 0) must NEVER be treated as success / 0x00 ACK.
+            return r == 1 ? 1 : (r == 0 ? -1 : r);
         });
     }
 
@@ -110,7 +111,7 @@ public:
             char ch = 0;
             if (!ScpWaitFor(cs_, false, timeoutMs, [&] {
                     int r = static_cast<int>(channel_->read(&ch, 1));
-                    return r == 1 ? 1 : r;
+                    return r == 1 ? 1 : (r == 0 ? -1 : r);
                 })) {
                 return false;
             }
@@ -341,7 +342,9 @@ bool OpenScpDownloadChannel(pConnectSettings cs, const char* filename,
                         err == LIBSSH2_ERROR_SOCKET_SEND ||
                         err == LIBSSH2_ERROR_CHANNEL_OUTOFORDER)) {
                 ShowStatusId(IDS_LOG_SCP_DROPPED, nullptr, true);
+                auto savedFeedback = std::move(cs->feedback);
                 SftpCloseConnection(cs);
+                cs->feedback = std::move(savedFeedback);
                 Sleep(RECONNECT_SLEEP_MS);
                 if (SftpConnect(cs) == SFTP_OK) {
                     didReconnect = true;
@@ -398,8 +401,9 @@ int ShellScpDownloadFile(pConnectSettings cs,
 
     int64_t remoteSize = hintedFileSize;
     bool gotDataHeader = false;
-    bool lastWasCr = false;
+    DownloadTextFilter textFilter(textMode);
     std::vector<char> dataBuf(SFTP_MAX_READ_SIZE * 2);
+    std::vector<char> converted;
     auto lastProgress = std::chrono::steady_clock::now();
 
     while (true) {
@@ -447,20 +451,19 @@ int ShellScpDownloadFile(pConnectSettings cs,
 
         int64_t remaining = remoteSize;
         while (remaining > 0) {
-            const size_t want = std::min<size_t>(static_cast<size_t>(remaining),
-                                                textMode ? dataBuf.size() / 2 : dataBuf.size());
+            const size_t want = std::min<size_t>(static_cast<size_t>(remaining), dataBuf.size());
             int rc = static_cast<int>(scp.get()->read(dataBuf.data(), want));
             if (rc > 0) {
                 lastProgress = std::chrono::steady_clock::now();
                 remaining -= rc;
-                int wlen = rc;
-                if (textMode)
-                    wlen = ConvertCrToCrLf(dataBuf.data(), static_cast<size_t>(rc), dataBuf.size(), &lastWasCr);
-                if (wlen < 0)
-                    return SFTP_READFAILED;
+                converted.clear();
+                textFilter.Feed(dataBuf.data(), static_cast<size_t>(rc), converted);
+                if (remaining <= 0)
+                    textFilter.Finish(converted);
                 DWORD written = 0;
-                if (!WriteFile(localfile, dataBuf.data(), static_cast<DWORD>(wlen), &written, nullptr) ||
-                    written != static_cast<DWORD>(wlen)) {
+                if (!converted.empty() &&
+                    (!WriteFile(localfile, converted.data(), static_cast<DWORD>(converted.size()), &written, nullptr) ||
+                     written != static_cast<DWORD>(converted.size()))) {
                     return SFTP_WRITEFAILED;
                 }
                 *outSizeLoaded += rc;

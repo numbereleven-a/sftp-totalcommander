@@ -73,6 +73,8 @@ BOOL CreateDirectoryT(LPCWSTR lpPathName, LPSECURITY_ATTRIBUTES lpSecurityAttrib
 BOOL RemoveDirectoryT(LPCWSTR lpPathName) noexcept;
 BOOL DeleteFileT(LPCWSTR lpFileName) noexcept;
 BOOL MoveFileT(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName) noexcept;
+BOOL MoveFileExT(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, DWORD dwFlags) noexcept;
+BOOL GetFileAttributesExT(LPCWSTR lpFileName, WIN32_FILE_ATTRIBUTE_DATA* lpFileInformation) noexcept;
 BOOL SetFileAttributesT(LPCWSTR lpFileName, DWORD dwFileAttributes) noexcept;
 
 HANDLE CreateFileT(

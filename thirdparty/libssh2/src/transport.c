@@ -160,6 +160,8 @@ decrypt(LIBSSH2_SESSION * session, unsigned char *source,
                                         &session->remote.crypt_abstract,
                                         lowerfirstlast)) {
             LIBSSH2_FREE(session, p->payload);
+            p->payload = NULL;
+            p->total_num = 0;
             return LIBSSH2_ERROR_DECRYPT;
         }
 
@@ -317,8 +319,11 @@ fullpacket(LIBSSH2_SESSION * session, int encrypted /* 1 or 0 */ )
                                               session->fullpacket_payload_len,
                                               &session->remote.comp_abstract);
             LIBSSH2_FREE(session, p->payload);
-            if(rc)
+            p->payload = NULL;
+            if(rc) {
+                p->total_num = 0;
                 return rc;
+            }
 
             p->payload = data;
             session->fullpacket_payload_len = data_len;
@@ -813,6 +818,10 @@ int _libssh2_transport_read(LIBSSH2_SESSION * session)
                                                0);
 
                 if(rc != LIBSSH2_ERROR_NONE) {
+                    if(p->payload) {
+                        LIBSSH2_FREE(session, p->payload);
+                        p->payload = NULL;
+                    }
                     p->total_num = 0;   /* no packet buffer available */
                     return rc;
                 }
@@ -839,6 +848,10 @@ int _libssh2_transport_read(LIBSSH2_SESSION * session)
                              firstlast);
 
                 if(rc != LIBSSH2_ERROR_NONE) {
+                    if(p->payload) {
+                        LIBSSH2_FREE(session, p->payload);
+                        p->payload = NULL;
+                    }
                     p->total_num = 0;   /* no packet buffer available */
                     return rc;
                 }
@@ -863,8 +876,11 @@ int _libssh2_transport_read(LIBSSH2_SESSION * session)
                 memcpy(p->wptr, &p->buf[p->readidx], numbytes);
             }
             else {
-                if(p->payload)
+                if(p->payload) {
                     LIBSSH2_FREE(session, p->payload);
+                    p->payload = NULL;
+                }
+                p->total_num = 0;
                 return LIBSSH2_ERROR_OUT_OF_BOUNDARY;
             }
 

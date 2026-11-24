@@ -455,46 +455,59 @@ bool WaitForSshIo(pConnectSettings cs, DWORD timeoutMs)
 extern "C"
 int mysend(SOCKET s, LPCSTR buf, int len, int flags, LPCSTR progressmessage, int progressstart, int * ploop, SYSTICKS * plasttime)
 {
-    int ret = SOCKET_ERROR;
-    while (true) {
-        ret = send(s, buf, len, flags);
-        if (ret >= 0)
-            return ret;
+    int sent = 0;
+    const ULONGLONG deadline = GetTickCount64() + 30000;
+    while (sent < len) {
+        int ret = send(s, buf + sent, len - sent, flags);
+        if (ret > 0) {
+            sent += ret;
+            continue;
+        }
+        if (ret == 0)
+            return sent > 0 ? sent : SOCKET_ERROR;
         int err = WSAGetLastError();
         if (err == WSAEWOULDBLOCK) {
+            if (GetTickCount64() >= deadline)
+                return SOCKET_ERROR;
             IsSocketWritable(s);
             if (ProgressLoop(progressmessage, progressstart, progressstart + 10, ploop, plasttime))
-                break;
+                return SOCKET_ERROR;
         } else {
-            break;
+            return SOCKET_ERROR;
         }
     }
-    return ret;
+    return sent;
 }
 
 extern "C"
 int myrecv(SOCKET s, LPSTR buf, int len, int flags, LPCSTR progressmessage, int progressstart, int * ploop, SYSTICKS * plasttime)
 {
     int totallen = len;
-    int ret = SOCKET_ERROR;
-    while (true) {
+    int received = 0;
+    ULONGLONG idleDeadline = GetTickCount64() + 30000;
+    while (len > 0) {
         if (IsSocketReadable(s)) {
-            ret = recv(s, buf, len, flags);
+            int ret = recv(s, buf, len, flags);
             if (ret == len)
                 return totallen;
             if (ret > 0) {
                 buf += ret;
                 len -= ret;
+                received += ret;
+                idleDeadline = GetTickCount64() + 30000;
                 continue;
             }
+            if (ret == 0)
+                return received; // peer closed cleanly — do not inspect stale WSAEWOULDBLOCK
             if (WSAGetLastError() != WSAEWOULDBLOCK)
-                return ret;
+                return SOCKET_ERROR;
         }
+        if (GetTickCount64() >= idleDeadline)
+            return SOCKET_ERROR;
         if (ProgressLoop(progressmessage, progressstart, progressstart + 10, ploop, plasttime))
-            break;   /* User aborted. */
-        // IsSocketReadable() already performs the bounded readiness wait.
+            return SOCKET_ERROR;   /* User aborted. */
     }
-    return ret;
+    return received;
 }
 
 // ---------------------------------------------------------------------------
@@ -743,7 +756,7 @@ int SftpConnect(pConnectSettings ConnectSettings)
             return precheckCode;
     }
 
-    if (ProgressProc(PluginNumber, "Connecting...", "-", progress))
+    if (ProgressProc && ProgressProc(PluginNumber, "Connecting...", "-", progress))
         return fail(-9);
 
     if (!ResolveConnectEndpoint(ConnectSettings, connecttoserver.data(), connecttoserver.size(), &connecttoport)) {
@@ -765,6 +778,16 @@ int SftpConnect(pConnectSettings ConnectSettings)
     progress = PROG_SOCKET_CONNECT;
 
     if (ConnectSettings->use_jump_host && !ConnectSettings->jump_host.empty()) {
+        if (ConnectSettings->proxytype != sftp::Proxy::notused) {
+            const char* msg =
+                "This session is configured with both a proxy and a jump host. "
+                "The plugin connects to the jump host directly, which would bypass the proxy. "
+                "Disable either the proxy or the jump host.";
+            ShowStatus(msg);
+            if (ConnectSettings->feedback)
+                ConnectSettings->feedback->ShowError(msg);
+            return fail(-26);
+        }
         // -----------------------------------------------------------------
         // ProxyJump path:
         // 1. TCP + SSH to jump host
@@ -990,7 +1013,9 @@ bool ReconnectSFTPChannelIfNeeded(pConnectSettings ConnectSettings)
             CONN_LOG("ReconnectSFTP(SCP): session/sock lost (gone=%d sockLost=%d), reconnecting",
                      sessionGone ? 1 : 0, sockLost ? 1 : 0);
             ShowStatusId(IDS_LOG_SCP_RECONNECT, nullptr, true);
+            auto savedFeedback = std::move(ConnectSettings->feedback);
             SftpCloseConnection(ConnectSettings);
+            ConnectSettings->feedback = std::move(savedFeedback);
             Sleep(RECONNECT_SLEEP_MS);
             SftpConnect(ConnectSettings);
             CONN_LOG("ReconnectSFTP(SCP): after reconnect session=%s",
@@ -1006,11 +1031,14 @@ bool ReconnectSFTPChannelIfNeeded(pConnectSettings ConnectSettings)
         if (ConnectSettings->sftpsession) {
             do {
                 rc=ConnectSettings->sftpsession->shutdown();
+                if (rc == LIBSSH2_ERROR_EAGAIN)
+                    WaitForSshIo(ConnectSettings);
             } while (rc == LIBSSH2_ERROR_EAGAIN && get_ticks_between(starttime) < RECONNECT_SFTP_TIMEOUT_MS);
             ConnectSettings->sftpsession.reset();
         }
 
-        if (ConnectSettings->session)
+        if (ConnectSettings->session) {
+            const SYSTICKS initStart = get_sys_ticks();
             do {
                 ConnectSettings->sftpsession = nullptr;
                 if (ProgressLoop("Reconnect SFTP channel", 0, 100, &loop, &starttime))
@@ -1025,12 +1053,18 @@ bool ReconnectSFTPChannelIfNeeded(pConnectSettings ConnectSettings)
                         break;
                     }
                 }
+                if (get_ticks_between(initStart) >= RECONNECT_SFTP_TIMEOUT_MS)
+                    break;
+                WaitForSshIo(ConnectSettings);
             } while (!ConnectSettings->sftpsession);
+        }
 
         // Reconnect the full connection when subsystem recovery fails.
         if (!ConnectSettings->sftpsession) {
             ShowStatusId(IDS_LOG_RECONNECT, nullptr, true);
+            auto savedFeedback = std::move(ConnectSettings->feedback);
             SftpCloseConnection(ConnectSettings);
+            ConnectSettings->feedback = std::move(savedFeedback);
             Sleep(RECONNECT_SLEEP_MS);
             SftpConnect(ConnectSettings);
         }

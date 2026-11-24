@@ -27,7 +27,7 @@ try {
     $objects | Set-Content "$output/ssh-objects.rsp" -Encoding ascii
     foreach ($test in @('ssh_transfer_test','shell_upload_bench')) {
         $extra = if ($test -eq 'shell_upload_bench') { 'build/.intermediates/SFTPplug/{0}_Release/SessionImport.obj' -f $platform } else { '' }
-        $compile = 'call "{0}" >nul && cl /c /nologo /std:c++20 /EHsc /O2 /MT /GR- /FI global.h /DSFTP_ALLINONE /DLIBSSH2_API= /I src /I src/include tests/{3}.cpp /Fo:{2}/{3}.obj && link /nologo /OUT:{2}/{3}.exe /SUBSYSTEM:CONSOLE /LTCG /OPT:REF {2}/{3}.obj @{2}/ssh-objects.rsp {4} /LIBPATH:src/lib libssh2_{1}.lib mbedcrypto_{1}.lib argon2_a_{1}.lib ws2_32.lib bcrypt.lib crypt32.lib winhttp.lib iphlpapi.lib shlwapi.lib advapi32.lib user32.lib gdi32.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib comctl32.lib dbghelp.lib 2>&1' -f $VcVarsPath,$Architecture,$output,$test,$extra
+        $compile = 'call "{0}" >nul && cl /c /nologo /std:c++20 /EHsc /O2 /MT /GR- /FI global.h /DSFTP_ALLINONE /DLIBSSH2_API= /I src /I src/include tests/{3}.cpp /Fo:{2}/{3}.obj && link /nologo /OUT:{2}/{3}.exe /SUBSYSTEM:CONSOLE /LTCG /OPT:REF {2}/{3}.obj @{2}/ssh-objects.rsp {4} /LIBPATH:src/lib libssh2_{1}.lib mbedcrypto_{1}.lib argon2_a_{1}.lib ws2_32.lib bcrypt.lib crypt32.lib winhttp.lib iphlpapi.lib shlwapi.lib advapi32.lib user32.lib gdi32.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib comctl32.lib 2>&1' -f $VcVarsPath,$Architecture,$output,$test,$extra
         & $env:COMSPEC /d /s /c $compile
         if ($LASTEXITCODE) { throw 'SSH integration test compilation failed' }
     }

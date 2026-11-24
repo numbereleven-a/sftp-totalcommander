@@ -97,6 +97,7 @@ struct ISftpSession {
     virtual int realpath(const char* path, char* target, unsigned tlen) = 0;
     virtual int setstat(const char* path, LIBSSH2_SFTP_ATTRIBUTES* attrs) = 0;
     virtual int rename(const char* src, const char* dst) = 0;
+    virtual int posixRename(const char* src, const char* dst) = 0;
     virtual int unlink(const char* path) = 0;
     virtual int mkdir(const char* path, long mode) = 0;
     virtual int rmdir(const char* path) = 0;

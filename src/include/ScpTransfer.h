@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <string>
+#include <vector>
 #include <memory>
 #include "SftpClient.h"
 
@@ -14,6 +15,14 @@ bool OpenScpDownloadChannel(
     std::unique_ptr<ISshChannel>& outChannel,
     libssh2_struct_stat* outInfo);
 
+bool ShellRunPersistentCommand(
+    pConnectSettings cs,
+    const std::string& command,
+    std::vector<std::string>& outLines,
+    int* outExitCode = nullptr);
+
+bool ShellSetRemoteMtime(pConnectSettings cs, const std::string& remotePath, long mtime);
+
 int ShellDdDownloadFile(
     pConnectSettings cs,
     const std::string& remotePathArg,
@@ -22,7 +31,8 @@ int ShellDdDownloadFile(
     LPCWSTR localNameW,
     int64_t fileSize,
     int64_t resumeFrom,
-    int64_t* outSizeLoaded);
+    int64_t* outSizeLoaded,
+    bool textMode = false);
 
 int ShellDdUploadFile(
     pConnectSettings cs,
@@ -32,7 +42,8 @@ int ShellDdUploadFile(
     LPCWSTR localNameW,
     int64_t fileSize,
     int64_t resumeFrom,
-    int64_t* outSizeLoaded);
+    int64_t* outSizeLoaded,
+    bool textMode = false);
 
 int ShellScpDownloadFile(
     pConnectSettings cs,
@@ -52,4 +63,5 @@ int ShellScpUploadFile(
     LPCWSTR localNameW,
     int64_t fileSize,
     bool textMode,
-    int64_t* outSizeLoaded);
+    int64_t* outSizeLoaded,
+    long mtime = 0);

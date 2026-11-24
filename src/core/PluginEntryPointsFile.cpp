@@ -93,7 +93,21 @@ int WINAPI FsExecuteFileW(HWND MainWin, LPWSTR RemoteName, LPCWSTR Verb)
             // Open quick/new-connection dialog directly from the helper entry.
             pConnectSettings serveridQuick = SftpConnectToServer(s_quickconnect, inifilename, nullptr);
             LoadServersFromIniW(inifilenameW, s_quickconnect);
-            return serveridQuick ? FS_EXEC_OK : FS_EXEC_YOURSELF;
+            if (!serveridQuick)
+                return FS_EXEC_YOURSELF;
+            SetServerIdForName(s_quickconnect, static_cast<SERVERID>(serveridQuick));
+            const std::wstring target = L"\\" + std::wstring(s_quickconnectW.data());
+            const size_t used = target.size();
+            if (used + 2 < wdirtypemax) {
+                wcslcpy(RemoteName, target.c_str(), wdirtypemax - 1);
+                SftpGetLastActivePathW(serveridQuick, RemoteName + used,
+                                       static_cast<int>(wdirtypemax - used - 1));
+                if (RemoteName[used] == 0)
+                    wcslcat(RemoteName, L"/", wdirtypemax - 1);
+                ReplaceSlashByBackslashW(RemoteName);
+                return FS_EXEC_SYMLINK;
+            }
+            return FS_EXEC_OK;
         }
         if (_wcsicmp(Verb, L"properties") == 0) {
             if (RemoteName[1] && wcschr(RemoteName+1, L'\\') == 0) {
@@ -311,7 +325,10 @@ static bool FileExistsT(LPCWSTR LocalName)
     return true;
 }
 
-static void SanitizeLocalFileNameW(LPWSTR localPath) noexcept
+// Sanitize the filename component of TC's local destination path in place
+// (preserving string length): invalid Windows characters, trailing dot/space,
+// and Windows reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9).
+void SanitizeLocalFileNameW(LPWSTR localPath) noexcept
 {
     if (!localPath || !localPath[0])
         return;
@@ -319,16 +336,28 @@ static void SanitizeLocalFileNameW(LPWSTR localPath) noexcept
     const size_t slashPos = pathView.find_last_of(L"\\/");
     if (slashPos == std::wstring_view::npos || slashPos + 1 >= pathView.size())
         return;
-    wchar_t* filePart = localPath + slashPos + 1;
-    while (*filePart) {
-        if (static_cast<unsigned>(*filePart) < 32u) {
-            *filePart = L' ';
-        } else if (*filePart == L':' || *filePart == L'|' || *filePart == L'*' || *filePart == L'?' ||
-                   *filePart == L'\\' || *filePart == L'/' || *filePart == L'"') {
-            *filePart = L'_';
-        }
-        ++filePart;
+    wchar_t* const name = localPath + slashPos + 1;
+    for (wchar_t* p = name; *p; ++p) {
+        if (static_cast<unsigned>(*p) < 32u || wcschr(L"<>:\"|?*\\/", *p))
+            *p = L'_';
     }
+    const size_t len = wcslen(name);
+    if (len > 0 && (name[len - 1] == L'.' || name[len - 1] == L' '))
+        name[len - 1] = L'_';
+
+    size_t baseLen = wcscspn(name, L".");
+    while (baseLen > 0 && name[baseLen - 1] == L' ')
+        --baseLen;
+    const std::wstring_view base(name, baseLen);
+    auto isDev = [&](const wchar_t* dev) {
+        return base.size() == wcslen(dev) && _wcsnicmp(base.data(), dev, base.size()) == 0;
+    };
+    bool device = isDev(L"CON") || isDev(L"PRN") || isDev(L"AUX") || isDev(L"NUL") ||
+                  isDev(L"CONIN$") || isDev(L"CONOUT$");
+    if (!device && base.size() == 4 && base[3] >= L'1' && base[3] <= L'9')
+        device = _wcsnicmp(base.data(), L"COM", 3) == 0 || _wcsnicmp(base.data(), L"LPT", 3) == 0;
+    if (device && baseLen > 0)
+        name[baseLen - 1] = L'_';
 }
 
 static int CreateHelpFileLocalW(LPCWSTR localName, bool overwrite)
@@ -388,7 +417,7 @@ int WINAPI FsGetFileW(LPCWSTR RemoteName, LPWSTR LocalName, int CopyFlags, Remot
 
         int startPct = 0;
         if (Resume && ri && ri->Size64 > 0) {
-            HANDLE h = CreateFileW(LocalName, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            HANDLE h = CreateFileT(LocalName, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                                    nullptr, OPEN_EXISTING, 0, nullptr);
             if (h != INVALID_HANDLE_VALUE) {
                 LARGE_INTEGER li{};
@@ -409,12 +438,25 @@ int WINAPI FsGetFileW(LPCWSTR RemoteName, LPWSTR LocalName, int CopyFlags, Remot
                 return FS_FILE_NOTSUPPORTED;
             return FS_FILE_EXISTSRESUMEALLOWED;
         }
-        if (OverWrite) {
-            DeleteFileT(LocalName);
+        if (OverWrite && !serverid->scponly && !IsPhpAgentTransport(serverid) && !IsLanPairTransport(serverid)) {
+            // SFTP mode opens LocalName via CREATE_NEW/OPEN_ALWAYS after remote open succeeds;
+            // keep pre-existing file intact for SCP/Shell/PHP/LAN staged overwrites.
         }
-        // Never remove a pre-existing destination after a failed open/write.
-        const bool removeFailedDownload = GetFileAttributesW(LocalName) == INVALID_FILE_ATTRIBUTES &&
-            (GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND);
+        WIN32_FILE_ATTRIBUTE_DATA beforeData{};
+        const bool existedBefore = GetFileAttributesExT(LocalName, &beforeData) != 0;
+        auto wasTouched = [&]() -> bool {
+            WIN32_FILE_ATTRIBUTE_DATA nowData{};
+            if (!GetFileAttributesExT(LocalName, &nowData))
+                return false;
+            return !existedBefore ||
+                   nowData.nFileSizeHigh != beforeData.nFileSizeHigh ||
+                   nowData.nFileSizeLow != beforeData.nFileSizeLow ||
+                   nowData.ftLastWriteTime.dwHighDateTime != beforeData.ftLastWriteTime.dwHighDateTime ||
+                   nowData.ftLastWriteTime.dwLowDateTime != beforeData.ftLastWriteTime.dwLowDateTime;
+        };
+        if (OverWrite && !existedBefore) {
+            // Nothing to remove.
+        }
 
         // PHP Agent TAR batch download: queue single file instead of downloading individually.
         if (ri && !(ri->Attr & FILE_ATTRIBUTE_DIRECTORY) &&
@@ -431,7 +473,7 @@ int WINAPI FsGetFileW(LPCWSTR RemoteName, LPWSTR LocalName, int CopyFlags, Remot
         if (ri && (ri->Attr & FILE_ATTRIBUTE_DIRECTORY) &&
             !Move && IsPhpAgentTransport(serverid) && serverid->php_tar)
         {
-            CreateDirectoryW(LocalName, nullptr);
+            CreateDirectoryT(LocalName, nullptr);
             const int rc = PhpAgentDownloadDirAsTar(serverid, remotedir.data(), LocalName, OverWrite);
             if (rc == SFTP_OK)    return FS_FILE_OK;
             if (rc == SFTP_ABORT) return FS_FILE_USERABORT;
@@ -443,7 +485,7 @@ int WINAPI FsGetFileW(LPCWSTR RemoteName, LPWSTR LocalName, int CopyFlags, Remot
         if (IsLanPairTransport(serverid)) {
             if (!serverid->lanSession || !serverid->lanSession->isConnected())
                 return HandleBatchDownloadError(RemoteName, LocalName, Move, RequestedResume,
-                                                FS_FILE_READERROR, removeFailedDownload);
+                                                FS_FILE_READERROR, !existedBefore && wasTouched());
             const std::string remoteUtf8 = LanRemotePathToUtf8(remotedir.data());
             int fsResult = FS_FILE_READERROR;
             serverid->lanSession->getFile(remoteUtf8, LocalName,
@@ -452,7 +494,7 @@ int WINAPI FsGetFileW(LPCWSTR RemoteName, LPWSTR LocalName, int CopyFlags, Remot
                                           OverWrite, Resume, &fsResult);
             if (fsResult == FS_FILE_READERROR || fsResult == FS_FILE_WRITEERROR || fsResult == FS_FILE_NOTFOUND)
                 return HandleBatchDownloadError(RemoteName, LocalName, Move, RequestedResume,
-                                                fsResult, removeFailedDownload);
+                                                fsResult, wasTouched());
             if (fsResult == FS_FILE_OK && Move && !RequestedResume &&
                 !serverid->lanSession->remove(remoteUtf8)) return FS_FILE_WRITEERROR;
             return fsResult;
@@ -460,7 +502,7 @@ int WINAPI FsGetFileW(LPCWSTR RemoteName, LPWSTR LocalName, int CopyFlags, Remot
 
         int64_t previousPartialSize = -1;
         while (true) {  // auto-resume loop
-            int rc = SftpDownloadFileW(serverid, remotedir.data(), LocalName, true, ri->Size64, &ri->LastWriteTime, Resume);
+            int rc = SftpDownloadFileW(serverid, remotedir.data(), LocalName, OverWrite, ri->Size64, &ri->LastWriteTime, Resume);
             SFTP_LOG("ENTRY", "FsGetFileW SftpDownloadFileW rc=%d", rc);
             switch (rc) {
                 case SFTP_OK:
@@ -470,13 +512,13 @@ int WINAPI FsGetFileW(LPCWSTR RemoteName, LPWSTR LocalName, int CopyFlags, Remot
                     return FS_FILE_OK;
                 case SFTP_EXISTS:      return FS_FILE_EXISTS;
                 case SFTP_READFAILED:  return HandleBatchDownloadError(RemoteName, LocalName, Move, RequestedResume,
-                                                                       FS_FILE_READERROR, removeFailedDownload);
+                                                                       FS_FILE_READERROR, wasTouched());
                 case SFTP_WRITEFAILED: return HandleBatchDownloadError(RemoteName, LocalName, Move, RequestedResume,
-                                                                       FS_FILE_WRITEERROR, removeFailedDownload);
+                                                                       FS_FILE_WRITEERROR, wasTouched());
                 case SFTP_ABORT:       return FS_FILE_USERABORT;
                 case SFTP_PARTIAL: {
                     WIN32_FILE_ATTRIBUTE_DATA data{};
-                    if (!GetFileAttributesExW(LocalName, GetFileExInfoStandard, &data)) return FS_FILE_READERROR;
+                    if (!GetFileAttributesExT(LocalName, &data)) return FS_FILE_READERROR;
                     const int64_t size = (static_cast<int64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
                     if (size <= previousPartialSize) return FS_FILE_READERROR;
                     previousPartialSize = size;
@@ -484,7 +526,7 @@ int WINAPI FsGetFileW(LPCWSTR RemoteName, LPWSTR LocalName, int CopyFlags, Remot
                     break;
                 }
                 default:               return HandleBatchDownloadError(RemoteName, LocalName, Move, RequestedResume,
-                                                                       FS_FILE_READERROR, removeFailedDownload);
+                                                                       FS_FILE_READERROR, wasTouched());
             }
         }
         return FS_FILE_OK;
@@ -545,7 +587,7 @@ int WINAPI FsPutFileW(LPCWSTR LocalName, LPCWSTR RemoteName, int CopyFlags)
             const std::string remoteUtf8 = LanRemotePathToUtf8(remotedir.data());
             int fsResult = FS_FILE_WRITEERROR;
             serverid->lanSession->putFile(LocalName, remoteUtf8, OverWrite, Resume, &fsResult);
-            if (fsResult == FS_FILE_OK && Move && !Resume && !DeleteFileW(LocalName)) return FS_FILE_WRITEERROR;
+            if (fsResult == FS_FILE_OK && Move && !Resume && !DeleteFileT(LocalName)) return FS_FILE_WRITEERROR;
             return fsResult;
         }
 
@@ -569,7 +611,7 @@ int WINAPI FsPutFileW(LPCWSTR LocalName, LPCWSTR RemoteName, int CopyFlags)
         SFTP_LOG("ENTRY", "FsPutFileW SftpUploadFileW rc=%d", rc);
         switch (rc) {
             case SFTP_OK:
-                if (Move && !Resume && !DeleteFileW(LocalName)) return FS_FILE_WRITEERROR;
+                if (Move && !Resume && !DeleteFileT(LocalName)) return FS_FILE_WRITEERROR;
                 if (Move && Resume) ShowStatus("Resumed move kept its source.");
                 return FS_FILE_OK;
             case SFTP_EXISTS:      return SftpSupportsResume(serverid) ? FS_FILE_EXISTSRESUMEALLOWED : FS_FILE_EXISTS;

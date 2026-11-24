@@ -7,6 +7,7 @@
 #include <string>
 #include <chrono>
 #include <array>
+#include <atomic>
 #include <ws2tcpip.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -29,7 +30,6 @@
 namespace {
 
 // TU-local derivations from shared constants (defined in ScpTransferInternal.h)
-constexpr size_t SFTP_TEXT_READ_SIZE  = SFTP_MAX_READ_SIZE / 2;
 constexpr size_t SFTP_PREFETCH_FACTOR = 64;
 constexpr int SFTP_ABORT_GRACE_MS = 2000;
 constexpr int SFTP_PROGRESS_ABORT_POLL_MS = 5000;
@@ -87,6 +87,13 @@ public:
     bool IsValid() const noexcept { return handle_ != nullptr && handle_ != INVALID_HANDLE_VALUE; }
     HANDLE get() const noexcept { return handle_; }
     HANDLE release() noexcept { return std::exchange(handle_, INVALID_HANDLE_VALUE); }
+
+    void Close() noexcept {
+        if (IsValid()) {
+            CloseHandle(handle_);
+            handle_ = INVALID_HANDLE_VALUE;
+        }
+    }
 
     int64_t GetSize() const {
         LARGE_INTEGER li{};
@@ -225,16 +232,40 @@ bool OpenLocalForWrite(LocalFile& file, LPCWSTR path, bool overwrite, bool resum
                      FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN);
 }
 
+// Create a unique sibling temporary file next to localName for atomic overwrites.
+bool OpenStagedLocalForWrite(LocalFile& file, LPCWSTR localName, std::wstring& outTempPath)
+{
+    static std::atomic<unsigned> tempSeq{1};
+    const DWORD pid = GetCurrentProcessId();
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        const unsigned seq = tempSeq.fetch_add(1, std::memory_order_relaxed);
+        wchar_t suffix[48]{};
+        _snwprintf_s(suffix, _countof(suffix), _TRUNCATE, L".sftptmp.%lu.%u", pid, seq);
+        std::wstring candidate = localName ? localName : L"";
+        candidate += suffix;
+        if (file.Open(candidate.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                      CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN)) {
+            outTempPath = std::move(candidate);
+            return true;
+        }
+        if (GetLastError() != ERROR_FILE_EXISTS)
+            return false;
+    }
+    return false;
+}
+
 // Download data loop (common for SFTP and SCP)
 template<typename Handle>
 int DownloadLoop(pConnectSettings cs, Handle& remote, LocalFile& local,
                  LPCWSTR remoteName, LPCWSTR localName,
                  bool& textMode, int64_t totalSize, int64_t& loaded,
-                 int64_t& scpRemain, bool& lastWasCr)
+                 int64_t& scpRemain)
 {
     const size_t maxReadSize = SFTP_MAX_READ_SIZE * SFTP_PREFETCH_FACTOR;
     std::vector<char> buffer(maxReadSize);
-    int blockSize = static_cast<int>(textMode ? SFTP_TEXT_READ_SIZE : maxReadSize);
+    const int blockSize = static_cast<int>(textMode ? (SFTP_MAX_READ_SIZE * 4) : maxReadSize);
+    DownloadTextFilter textFilter(textMode);
+    std::vector<char> converted;
     int ret = SFTP_OK;
     auto lastProgress = std::chrono::steady_clock::now();
 
@@ -250,27 +281,22 @@ int DownloadLoop(pConnectSettings cs, Handle& remote, LocalFile& local,
 
         if (len > 0) {
             lastProgress = std::chrono::steady_clock::now();
-            DWORD written = 0;
-            if (textMode && loaded == 0) {
-                // Detect binary data
-                for (int i = 0; i < len; ++i) {
-                    if (buffer[i] == 0) {
-                        textMode = false;
-                        break;
-                    }
-                }
-            }
             loaded += len;
-            int writeLen = len;
+            const char* writePtr = buffer.data();
+            size_t writeLen = static_cast<size_t>(len);
             if (textMode) {
-                writeLen = ConvertCrToCrLf(buffer.data(), static_cast<size_t>(len), buffer.size(), &lastWasCr);
-                if (writeLen < 0)
-                    return SFTP_READFAILED;
+                converted.clear();
+                writeLen = textFilter.Feed(buffer.data(), static_cast<size_t>(len), converted);
+                writePtr = converted.data();
+                textMode = textFilter.IsText();
             }
-            if (!WriteFile(local.get(), buffer.data(), static_cast<DWORD>(writeLen), &written, nullptr) ||
-                written != static_cast<DWORD>(writeLen)) {
-                ret = SFTP_WRITEFAILED;
-                break;
+            if (writeLen > 0) {
+                DWORD written = 0;
+                if (!WriteFile(local.get(), writePtr, static_cast<DWORD>(writeLen), &written, nullptr) ||
+                    written != static_cast<DWORD>(writeLen)) {
+                    ret = SFTP_WRITEFAILED;
+                    break;
+                }
             }
         } else if (len == LIBSSH2_ERROR_EAGAIN) {
             if constexpr (std::is_same_v<Handle, RemoteScpChannel>) {
@@ -296,6 +322,18 @@ int DownloadLoop(pConnectSettings cs, Handle& remote, LocalFile& local,
             break;
         }
     }
+
+    if (ret == SFTP_OK && textMode) {
+        converted.clear();
+        const size_t tailLen = textFilter.Finish(converted);
+        if (tailLen > 0) {
+            DWORD written = 0;
+            if (!WriteFile(local.get(), converted.data(), static_cast<DWORD>(tailLen), &written, nullptr) ||
+                written != static_cast<DWORD>(tailLen)) {
+                ret = SFTP_WRITEFAILED;
+            }
+        }
+    }
     return ret;
 }
 
@@ -308,6 +346,15 @@ int SftpDownloadFileW(pConnectSettings cs, LPCWSTR RemoteName, LPCWSTR LocalName
     if (IsPhpAgentTransport(cs))
         return PhpAgentDownloadFileW(cs, RemoteName, LocalName, alwaysOverwrite, filesize, Resume);
 
+    bool textMode = !binaryCopy && (cs->unixlinebreaks == 1) && SftpDetermineTransferModeW(RemoteName);
+    if (textMode && Resume) {
+        // Converted LF/CRLF byte offsets cannot safely resume an existing file.
+        // Only restart cleanly from 0 when overwrite was explicitly allowed.
+        if (!alwaysOverwrite)
+            return SFTP_FAILED;
+        Resume = false;
+    }
+
     const bool forceShellFallback = (cs->scponly && cs->shell_transfer_force && cs->shell_transfer_dd) ||
                                     (cs->scponly && Resume);
     bool useScp = cs->scpfordata;
@@ -317,9 +364,10 @@ int SftpDownloadFileW(pConnectSettings cs, LPCWSTR RemoteName, LPCWSTR LocalName
     ShowTransferStart(useScp, RemoteName, IDS_DOWNLOAD);
 
     std::string remotePath = ToRemotePathA(cs, RemoteName);
-    bool textMode = !binaryCopy && (cs->unixlinebreaks == 1) && SftpDetermineTransferModeW(RemoteName);
-    if (textMode && Resume)
-        return SFTP_FAILED;
+    if (cs->scponly && !ShellCommandIsSafe(remotePath)) {
+        ShowStatus("Download refused: remote path contains a control character.");
+        return SFTP_READFAILED;
+    }
 
     if (!ReconnectSFTPChannelIfNeeded(cs))
         return SFTP_FAILED;
@@ -327,10 +375,20 @@ int SftpDownloadFileW(pConnectSettings cs, LPCWSTR RemoteName, LPCWSTR LocalName
     if (useScp && !PrepareScpTransferSession(cs))
         return SFTP_FAILED;
 
-    // Open local file
+    // Stage into a sibling temp file when overwriting an existing local file so a
+    // failed/unreadable remote download leaves the existing local file intact.
+    WIN32_FILE_ATTRIBUTE_DATA existingAttr{};
+    const bool targetExisted = (GetFileAttributesExT(LocalName, &existingAttr) != 0);
+    bool staging = false;
+    std::wstring stagedPath;
+
     LocalFile local;
     int64_t loaded = 0;
-    if (!OpenLocalForWrite(local, LocalName, alwaysOverwrite, Resume, loaded, filesize)) {
+    if (alwaysOverwrite && !Resume && targetExisted) {
+        if (!OpenStagedLocalForWrite(local, LocalName, stagedPath))
+            return SFTP_WRITEFAILED;
+        staging = true;
+    } else if (!OpenLocalForWrite(local, LocalName, alwaysOverwrite, Resume, loaded, filesize)) {
         if (Resume && loaded == filesize)
             return SFTP_OK;
         if (!Resume && GetLastError() == ERROR_FILE_EXISTS)
@@ -338,68 +396,75 @@ int SftpDownloadFileW(pConnectSettings cs, LPCWSTR RemoteName, LPCWSTR LocalName
         return SFTP_WRITEFAILED;
     }
 
+    int ret = SFTP_OK;
     if (forceShellFallback) {
         int64_t shellLoaded = loaded;
-        return ShellDdDownloadFile(cs, remotePath, RemoteName,
-                                   local.get(), LocalName, filesize, loaded, &shellLoaded);
-    }
+        ret = ShellDdDownloadFile(cs, remotePath, RemoteName,
+                                  local.get(), LocalName, filesize, loaded, &shellLoaded, textMode);
+        loaded = shellLoaded;
+    } else if (useScp && cs->scponly) {
+        ret = ShellScpDownloadFile(cs, remotePath, RemoteName, local.get(), LocalName,
+                                   textMode, filesize, &loaded);
+    } else {
+        std::unique_ptr<ISftpHandle> sftpHandle;
+        std::unique_ptr<ISshChannel> scpHandle;
+        libssh2_struct_stat scpInfo{};
+        int64_t scpRemain = 0;
 
-    // Open remote
-    std::unique_ptr<ISftpHandle> sftpHandle;
-    std::unique_ptr<ISshChannel> scpHandle;
-    libssh2_struct_stat scpInfo{};
-    int64_t scpRemain = 0;
-
-    if (useScp) {
-        if (cs->scponly) {
-            // Shell SCP path
-            return ShellScpDownloadFile(cs, remotePath, RemoteName, local.get(), LocalName,
-                                        textMode, filesize, &loaded);
-        } else {
+        if (useScp) {
             if (!OpenScpDownloadChannel(cs, BuildScpPathArgument(remotePath).c_str(), scpHandle, &scpInfo))
-                return SFTP_READFAILED;
-            scpRemain = scpInfo.st_size;
-        }
-    } else {
-        sftpHandle = OpenSftpFileWithRetry(cs, remotePath.c_str(), LIBSSH2_FXF_READ, 0);
-        if (!sftpHandle)
-            return SFTP_READFAILED;
-
-        if (Resume && loaded > 0) {
-            sftpHandle->seek(static_cast<uint64_t>(loaded));
-            if (static_cast<int64_t>(sftpHandle->tell()) != loaded)
-                return SFTP_READFAILED;
-        }
-    }
-
-    // Download loop
-    bool lastWasCr = false;
-    int ret = SFTP_OK;
-    if (useScp) {
-        RemoteScpChannel remoteScp(std::move(scpHandle), cs);
-        ret = DownloadLoop(cs, remoteScp, local, RemoteName, LocalName,
-                           textMode, filesize, loaded, scpRemain, lastWasCr);
-        if (ret == SFTP_OK) {
-            std::string error;
-            if (scpRemain != 0 || !ScpReadAck(remoteScp.get(), cs, error))
                 ret = SFTP_READFAILED;
-            if (!error.empty()) ShowStatus(error.c_str());
+            else
+                scpRemain = scpInfo.st_size;
+        } else {
+            sftpHandle = OpenSftpFileWithRetry(cs, remotePath.c_str(), LIBSSH2_FXF_READ, 0);
+            if (!sftpHandle) {
+                ret = SFTP_READFAILED;
+            } else if (Resume && loaded > 0) {
+                sftpHandle->seek(static_cast<uint64_t>(loaded));
+                if (static_cast<int64_t>(sftpHandle->tell()) != loaded)
+                    ret = SFTP_READFAILED;
+            }
         }
-    } else {
-        RemoteSftpFile remoteSftp(std::move(sftpHandle));
-        int64_t dummyRemain = 0; // not used for SFTP
-        ret = DownloadLoop(cs, remoteSftp, local, RemoteName, LocalName,
-                           textMode, filesize, loaded, dummyRemain, lastWasCr);
-    }
-    if (ret == SFTP_OK && loaded != filesize)
-        ret = SFTP_READFAILED;
 
-    // Close remote (RAII handles will close automatically)
+        if (ret == SFTP_OK) {
+            if (useScp) {
+                RemoteScpChannel remoteScp(std::move(scpHandle), cs);
+                ret = DownloadLoop(cs, remoteScp, local, RemoteName, LocalName,
+                                   textMode, filesize, loaded, scpRemain);
+                if (ret == SFTP_OK) {
+                    std::string error;
+                    if (scpRemain != 0 || !ScpReadAck(remoteScp.get(), cs, error))
+                        ret = SFTP_READFAILED;
+                    if (!error.empty()) ShowStatus(error.c_str());
+                }
+            } else {
+                RemoteSftpFile remoteSftp(std::move(sftpHandle));
+                int64_t dummyRemain = 0; // not used for SFTP
+                ret = DownloadLoop(cs, remoteSftp, local, RemoteName, LocalName,
+                                   textMode, filesize, loaded, dummyRemain);
+            }
+            if (ret == SFTP_OK && loaded != filesize)
+                ret = SFTP_READFAILED;
+        }
+    }
+
     if (ret == SFTP_OK && ft)
         SetFileTime(local.get(), nullptr, nullptr, ft);
 
-    if (ret == SFTP_READFAILED && loaded > 0 && loaded < filesize && !cs->scponly)
+    if (staging) {
+        local.Close();
+        if (ret == SFTP_OK) {
+            if (!MoveFileExT(stagedPath.c_str(), LocalName, MOVEFILE_REPLACE_EXISTING)) {
+                DeleteFileT(stagedPath.c_str());
+                ret = SFTP_WRITEFAILED;
+            }
+        } else {
+            DeleteFileT(stagedPath.c_str());
+        }
+    } else if (ret == SFTP_READFAILED && loaded > 0 && loaded < filesize && !cs->scponly && !textMode) {
         ret = SFTP_PARTIAL;
+    }
 
     return ret;
 }
@@ -410,6 +475,11 @@ int SftpUploadFileW(pConnectSettings cs, LPCWSTR LocalName, LPCWSTR RemoteName,
     if (!cs) return SFTP_FAILED;
     if (IsPhpAgentTransport(cs))
         return PhpAgentUploadFileW(cs, LocalName, RemoteName, Resume);
+
+    bool textMode = !binaryCopy && (cs->unixlinebreaks == 1) && SftpDetermineTransferModeW(LocalName);
+    // Converted CRLF/LF byte offsets cannot safely resume an existing remote file.
+    if (Resume && textMode)
+        return SFTP_WRITEFAILED;
 
     const bool forceShellFallback = (cs->scponly && cs->shell_transfer_force && cs->shell_transfer_dd) ||
                                     (cs->scponly && Resume);
@@ -433,18 +503,30 @@ int SftpUploadFileW(pConnectSettings cs, LPCWSTR LocalName, LPCWSTR RemoteName,
     ShowTransferStart(useScp, RemoteName, IDS_UPLOAD);
 
     std::string remotePath = ToRemotePathA(cs, RemoteName);
-    bool textMode = !binaryCopy && (cs->unixlinebreaks == 1) && SftpDetermineTransferModeW(LocalName);
-    // Converted byte offsets cannot safely resume an existing remote file.
-    if (Resume && textMode) return SFTP_WRITEFAILED;
-
-    if (forceShellFallback) {
-        int64_t shellUploaded = 0;
-        return ShellDdUploadFile(cs, remotePath, RemoteName,
-                                 local.get(), LocalName, filesize, Resume ? 1 : 0, &shellUploaded);
+    if (cs->scponly && !ShellCommandIsSafe(remotePath)) {
+        ShowStatus("Upload refused: remote path contains a control character.");
+        return SFTP_WRITEFAILED;
     }
 
     if (!ReconnectSFTPChannelIfNeeded(cs))
         return SFTP_FAILED;
+
+    long localMtime = 0;
+    if (setattr) {
+        FILETIME ft{};
+        if (GetFileTime(local.get(), nullptr, nullptr, &ft))
+            localMtime = GetUnixTime(&ft);
+    }
+
+    if (forceShellFallback) {
+        int64_t shellUploaded = 0;
+        const int rc = ShellDdUploadFile(cs, remotePath, RemoteName,
+                                         local.get(), LocalName, filesize,
+                                         Resume ? 1 : 0, &shellUploaded, textMode);
+        if (rc == SFTP_OK && setattr && localMtime > 0)
+            ShellSetRemoteMtime(cs, remotePath, localMtime);
+        return rc;
+    }
 
     if (useScp && !PrepareScpTransferSession(cs))
         return SFTP_FAILED;
@@ -492,18 +574,16 @@ int SftpUploadFileW(pConnectSettings cs, LPCWSTR LocalName, LPCWSTR RemoteName,
     if (useScp) {
         if (cs->scponly) {
             // Shell SCP upload
+            int64_t scpUploaded = 0;
             return ShellScpUploadFile(cs, remotePath, RemoteName,
-                                      local.get(), LocalName, uploadSize, textMode, &filesize);
+                                      local.get(), LocalName, filesize, textMode, &scpUploaded,
+                                      setattr ? localMtime : 0);
         } else {
             // Native SCP upload
-            FILETIME ft;
-            long mtime = 0;
-            if (setattr && GetFileTime(local.get(), nullptr, nullptr, &ft))
-                mtime = GetUnixTime(&ft);
             const auto openStart = get_sys_ticks();
             do {
                 scpHandle = cs->session->scpSend64(remotePath.c_str(), cs->filemod,
-                    static_cast<uint64_t>(uploadSize), mtime, 0);
+                    static_cast<uint64_t>(uploadSize), localMtime, 0);
                 if (scpHandle || cs->session->lastErrno() != LIBSSH2_ERROR_EAGAIN)
                     break;
                 if (EscapePressed() || get_ticks_between(openStart) > SFTP_SCP_CHANNEL_OPEN_TIMEOUT_MS)

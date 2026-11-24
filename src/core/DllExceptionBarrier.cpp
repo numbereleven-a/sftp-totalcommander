@@ -26,9 +26,6 @@
 #include <system_error>
 #include <string>
 
-// Link dbghelp at compile time (also added to vcxproj AdditionalDependencies).
-#pragma comment(lib, "dbghelp.lib")
-
 namespace sftp {
 
 // ============================================================================
@@ -37,31 +34,65 @@ namespace sftp {
 
 namespace {
 
+using SymSetOptionsFn        = DWORD (WINAPI*)(DWORD);
+using SymInitializeFn        = BOOL  (WINAPI*)(HANDLE, PCSTR, BOOL);
+using SymFromAddrFn          = BOOL  (WINAPI*)(HANDLE, DWORD64, PDWORD64, PSYMBOL_INFO);
+using SymGetLineFromAddr64Fn = BOOL  (WINAPI*)(HANDLE, DWORD64, PDWORD, PIMAGEHLP_LINE64);
+using SymCleanupFn           = BOOL  (WINAPI*)(HANDLE);
+
 SRWLOCK                  g_sym_lock        = SRWLOCK_INIT; // serialises all DbgHelp calls
 std::atomic<bool>        g_sym_initialized{false};         // acquire/release, see EnsureSymbols()
+HMODULE                  g_dbghelp_mod     = nullptr;
+SymSetOptionsFn          g_sym_set_options = nullptr;
+SymInitializeFn          g_sym_initialize  = nullptr;
+SymFromAddrFn            g_sym_from_addr   = nullptr;
+SymGetLineFromAddr64Fn   g_sym_get_line    = nullptr;
+SymCleanupFn             g_sym_cleanup     = nullptr;
+
+// Load dbghelp.dll strictly from System32 so a copy next to Total Commander
+// or the plugin is never loaded in its place.
+HMODULE LoadDbgHelpFromSystem32() noexcept
+{
+    wchar_t sysDir[MAX_PATH] = {};
+    const UINT dirLen = ::GetSystemDirectoryW(sysDir, MAX_PATH);
+    if (dirLen == 0 || dirLen >= MAX_PATH - 16)
+        return nullptr;
+    std::wstring fullPath(sysDir, dirLen);
+    if (!fullPath.empty() && fullPath.back() != L'\\')
+        fullPath += L'\\';
+    fullPath += L"dbghelp.dll";
+    return ::LoadLibraryW(fullPath.c_str());
+}
 
 // EnsureSymbols — idempotent, lazy.  Acquires exclusive lock for first call.
 void EnsureSymbols() noexcept
 {
-    // Fast path: acquire-load guarantees that if we see true, every store
-    // performed by the initialising thread (SymInitialize etc.) is visible
-    // to us.  This is the double-checked locking pattern, correct under the
-    // C++ memory model (unlike a plain bool read which is formally UB and
-    // also subject to compiler hoisting across the lock).
     if (g_sym_initialized.load(std::memory_order_acquire))
         return;
 
     ::AcquireSRWLockExclusive(&g_sym_lock);
     if (!g_sym_initialized.load(std::memory_order_relaxed)) {
-        // SYMOPT_UNDNAME    — demangle C++ names
-        // SYMOPT_LOAD_LINES — load source file / line number info from PDB
-        // SYMOPT_DEFERRED_LOADS — don't load all modules up front (faster init)
-        ::SymSetOptions(SYMOPT_UNDNAME | SYMOPT_LOAD_LINES | SYMOPT_DEFERRED_LOADS);
-
-        // fInvadeProcess=TRUE: enumerate and load symbols for every module
-        // already mapped into the process.  This is the most robust option
-        // for a plugin where we cannot predict the search path at runtime.
-        ::SymInitialize(::GetCurrentProcess(), nullptr, TRUE);
+        g_dbghelp_mod = LoadDbgHelpFromSystem32();
+        if (g_dbghelp_mod) {
+            g_sym_set_options = reinterpret_cast<SymSetOptionsFn>(::GetProcAddress(g_dbghelp_mod, "SymSetOptions"));
+            g_sym_initialize  = reinterpret_cast<SymInitializeFn>(::GetProcAddress(g_dbghelp_mod, "SymInitialize"));
+            g_sym_from_addr   = reinterpret_cast<SymFromAddrFn>(::GetProcAddress(g_dbghelp_mod, "SymFromAddr"));
+            g_sym_get_line    = reinterpret_cast<SymGetLineFromAddr64Fn>(::GetProcAddress(g_dbghelp_mod, "SymGetLineFromAddr64"));
+            g_sym_cleanup     = reinterpret_cast<SymCleanupFn>(::GetProcAddress(g_dbghelp_mod, "SymCleanup"));
+            if (g_sym_set_options && g_sym_initialize && g_sym_from_addr) {
+                g_sym_set_options(SYMOPT_UNDNAME | SYMOPT_LOAD_LINES | SYMOPT_DEFERRED_LOADS |
+                                  SYMOPT_FAIL_CRITICAL_ERRORS | SYMOPT_NO_PROMPTS);
+                g_sym_initialize(::GetCurrentProcess(), nullptr, TRUE);
+            } else {
+                ::FreeLibrary(g_dbghelp_mod);
+                g_dbghelp_mod     = nullptr;
+                g_sym_set_options = nullptr;
+                g_sym_initialize  = nullptr;
+                g_sym_from_addr   = nullptr;
+                g_sym_get_line    = nullptr;
+                g_sym_cleanup     = nullptr;
+            }
+        }
         g_sym_initialized.store(true, std::memory_order_release);
     }
     ::ReleaseSRWLockExclusive(&g_sym_lock);
@@ -111,9 +142,10 @@ std::string BuildStackTrace(USHORT skip) noexcept
         DWORD64 sym_disp  = 0;
         DWORD   line_disp = 0;
 
-        const BOOL have_sym  = ::SymFromAddr(::GetCurrentProcess(), addr, &sym_disp, sym);
-        const BOOL have_line = have_sym &&
-            ::SymGetLineFromAddr64(::GetCurrentProcess(), addr, &line_disp, &line_info);
+        const BOOL have_sym  = g_sym_from_addr &&
+            g_sym_from_addr(::GetCurrentProcess(), addr, &sym_disp, sym);
+        const BOOL have_line = have_sym && g_sym_get_line &&
+            g_sym_get_line(::GetCurrentProcess(), addr, &line_disp, &line_info);
 
         char frame_line[600];
 
@@ -156,7 +188,17 @@ void ShutdownSymbols() noexcept
 {
     ::AcquireSRWLockExclusive(&g_sym_lock);
     if (g_sym_initialized.load(std::memory_order_relaxed)) {
-        ::SymCleanup(::GetCurrentProcess());
+        if (g_sym_cleanup)
+            g_sym_cleanup(::GetCurrentProcess());
+        if (g_dbghelp_mod) {
+            ::FreeLibrary(g_dbghelp_mod);
+            g_dbghelp_mod = nullptr;
+        }
+        g_sym_set_options = nullptr;
+        g_sym_initialize  = nullptr;
+        g_sym_from_addr   = nullptr;
+        g_sym_get_line    = nullptr;
+        g_sym_cleanup     = nullptr;
         g_sym_initialized.store(false, std::memory_order_relaxed);
     }
     ::ReleaseSRWLockExclusive(&g_sym_lock);

@@ -193,6 +193,10 @@ bool  GetChannelCommandReply(ISshSession* session, ISshChannel* channel, LPCSTR 
 void  DisconnectShell(ISshChannel* channel);
 bool  EnsureScpShell(pConnectSettings cs);
 void  CloseScpShell(pConnectSettings cs);
+bool  ShellCommandIsSafe(std::string_view text) noexcept;
+std::string ShellMarker(const char* base);
+std::string ShellEchoMarker(const std::string& marker);
+bool  RemoteEntryNameIsSafeW(LPCWSTR name) noexcept;
 bool  ScpReadCommandOutput(pConnectSettings cs, const char* endMarker, std::vector<std::string>& outLines, DWORD timeoutMs, const char* beginMarker = nullptr, std::string* endLine = nullptr);
 // 1 = exists, 0 = confirmed missing, -1 = the check failed.
 int SftpFileExistsW(pConnectSettings cs, LPCWSTR path);

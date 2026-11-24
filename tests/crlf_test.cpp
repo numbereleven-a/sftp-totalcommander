@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "ScpTransferInternal.h"
 
 struct CrLfState { bool pendingCr = false; int64_t total = 0; };
 
@@ -93,6 +94,75 @@ int main() {
         CountCrLfToLf(s.data() + 4, s.size() - 4, cs.pendingCr, cs.total); // "\nxyz"
         if (cs.pendingCr) ++cs.total;
         if (cs.total != (int64_t)RefConvert(s).size()) { printf("FAIL explicit split count\n"); ++failures; }
+    }
+
+    // DownloadTextFilter: uniform 64 KiB NUL-byte detection and chunk-invariant LF->CRLF.
+    {
+        auto runFilter = [](const std::string& input, bool textMode, size_t chunk, bool& outIsText) {
+            DownloadTextFilter filter(textMode);
+            std::string out;
+            std::vector<char> tmp;
+            for (size_t off = 0; off < input.size(); off += chunk) {
+                const size_t n = (std::min)(chunk, input.size() - off);
+                tmp.clear();
+                filter.Feed(input.data() + off, n, tmp);
+                out.append(tmp.data(), tmp.size());
+            }
+            tmp.clear();
+            filter.Finish(tmp);
+            out.append(tmp.data(), tmp.size());
+            outIsText = filter.IsText();
+            return out;
+        };
+
+        // Small text file across all chunk sizes (including split \r + \n).
+        const std::string smallText = "line1\nline2\r\nline3\rline4\n";
+        const std::string smallExp  = "line1\r\nline2\r\nline3\rline4\r\n";
+        for (size_t ch : {size_t{1}, size_t{2}, size_t{3}, size_t{7}, size_t{1024}}) {
+            bool isText = false;
+            const std::string got = runFilter(smallText, true, ch, isText);
+            if (!isText || got != smallExp) {
+                printf("FAIL DownloadTextFilter small text chunk=%zu\n", ch);
+                ++failures;
+            }
+        }
+
+        // NUL byte at 50 KiB (inside 64 KiB window) across 16 KiB chunks -> binary pass-through.
+        std::string binInWindow(80 * 1024, 'A');
+        binInWindow[10] = '\n';
+        binInWindow[50 * 1024] = '\0';
+        binInWindow[70 * 1024] = '\n';
+        {
+            bool isText = true;
+            const std::string got = runFilter(binInWindow, true, 16 * 1024, isText);
+            if (isText || got != binInWindow) {
+                printf("FAIL DownloadTextFilter NUL inside 64 KiB window\n");
+                ++failures;
+            }
+        }
+
+        // NUL byte at 70 KiB (outside 64 KiB window) -> commits text mode at 64 KiB.
+        std::string nulPastWindow(80 * 1024, 'B');
+        nulPastWindow[10] = '\n';
+        nulPastWindow[70 * 1024] = '\0';
+        {
+            bool isText = false;
+            const std::string got = runFilter(nulPastWindow, true, 16 * 1024, isText);
+            if (!isText || got.size() != nulPastWindow.size() + 1 || got[10] != '\r' || got[11] != '\n') {
+                printf("FAIL DownloadTextFilter NUL outside 64 KiB window\n");
+                ++failures;
+            }
+        }
+
+        // Binary mode passes through unchanged.
+        {
+            bool isText = true;
+            const std::string got = runFilter(smallText, false, 3, isText);
+            if (isText || got != smallText) {
+                printf("FAIL DownloadTextFilter binary mode\n");
+                ++failures;
+            }
+        }
     }
 
     printf(failures ? "FAILED %d cases\n" : "ALL OK (%d failures)\n", failures);

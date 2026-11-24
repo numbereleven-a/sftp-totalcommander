@@ -1,5 +1,32 @@
 # Release Notes
 
+## SFTPplug 10.4.0.0
+
+### Security
+
+- Loaded `dbghelp.dll` dynamically from `%SystemRoot%\System32` only on crash-handler demand (removed static `dbghelp.lib` import) and added `SYMOPT_FAIL_CRITICAL_ERRORS | SYMOPT_NO_PROMPTS`.
+- Scoped LAN Pair DPAPI protection to the current Windows user (`CRYPTPROTECT_UI_FORBIDDEN`, keeping transparent decryption of legacy blobs) and zeroed unprotected key material before `LocalFree`.
+- Replaced predictable shell-command markers with `BCryptGenRandom` tokens and split-quote echo, rejected control characters in shell/SCP paths and commands, and filtered unsafe remote directory names containing `\` or control characters across SFTP, SCP, and PHP listings.
+- Hardened `SanitizeLocalFileNameW` to neutralize `<`/`>`, trailing dots/spaces, and Windows reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`).
+- Added RAII secret wiping across connection settings (`~tConnectSettings`), jump host settings (`~JumpHostSettings`), HTTP/SOCKS5 proxy auth buffers, and authentication prompt buffers; moved debug log output from `C:\temp\sftpplug.log` to `%TEMP%\sftpplug.log` with 20 MB rotation.
+- Fixed remaining `libssh2` packet double-free paths in `_libssh2_transport_read` and rebuilt both static `libssh2` (`x64` / `x86`) mbedTLS libraries; fixed a 1–2 byte out-of-bounds read in `MimeEncodeData`.
+
+### Authentication & Jump Host
+
+- Fixed authentication retries and password persistence: Pageant failure now falls back to `privkeyfile`, key/login prompts allow up to 3 typed retries, refused stored passwords are not resent between `password` and `keyboard-interactive`, and `"new"` password prompts never auto-submit the stored password.
+- Fixed `useagent=1` hiding or erasing saved passwords, added `DisplayName:jump` Total Commander password-manager persistence for Jump Host passwords (`jumppassword=!`), and prevented silent downgrade from TC password manager to plain INI on password changes.
+- Improved Jump Host reliability: honored `protocoltype`, verified `SO_ERROR` on TCP connect, added 30-second handshake and per-stage auth timeouts, supported interactive OTP/2FA prompts in jump `keyboard-interactive`, and fell back to trying all methods when `userauth_list` fails.
+- Explicitly refused unsupported Proxy + Jump Host combinations instead of silently bypassing the proxy.
+
+### Transfers, Shell & Protocol Fixes
+
+- Added `posix-rename@openssh.com` (`libssh2_sftp_posix_rename_ex`) with automatic unlink fallback when overwriting an existing remote target via F6 rename/move.
+- Implemented staged atomic local overwrite (sibling temporary file + `MoveFileExT(..., MOVEFILE_REPLACE_EXISTING)`) so failed or unreadable remote downloads preserve pre-existing local files; extended `MakeExtraLongNameW` (`>= 248` chars, `\\?\UNC\`) and switched local file operations to long-path helpers.
+- Unified text/binary detection (`DownloadTextFilter`, 64 KiB NUL-byte window) and CRLF/LF conversion across SFTP, SCP, and shell fallback downloads/uploads, skipped partial auto-resume in text mode, and applied remote/local timestamps across shell and SCP transfers (`scp -pt` / `touch -m -c -t`).
+- Fixed `ScpChannel` EOF handling (EOF no longer masquerades as a `0x00` ACK), checked remote `cat` exit status in raw shell downloads, prevented failed raw transfers from permanently poisoning `shell_dd_b64only`, preserved resume offsets on raw-to-base64 download fallback, and made shell command waits use idle timeouts.
+- Expanded SFTP `readdir` filename/longentry buffers to 4096/8192 bytes, fixed SCP `ls -la` parsing for device nodes (`b`/`c`) and filenames with trailing spaces or `" -> "`, forced POSIX `/bin/sh` + `stty -echo` and `TZ=UTC0 LC_ALL=C` on shell sessions, and added `chmod`/mtime support in `scponly` mode.
+- Fixed `myrecv` busy-spin on closed sockets (EOF returns immediately) and added 30-second socket I/O deadlines in `mysend`/`myrecv`, preserved `feedback` across reconnects, prevented silent `MAX_PATH` truncation of long INI fields, fixed `[F7 = new connection]` quick-connect leak, and fixed PuTTY/WinSCP/KiTTY session import (`TryAgent`, IPv6 `[host]:port`, `KittyDecrypt` validation).
+
 ## SFTPplug 10.3.1.0
 
 ### Security
